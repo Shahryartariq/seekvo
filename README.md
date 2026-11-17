@@ -42,8 +42,9 @@ Goal for the first release: index a 1 TB drive in under 10 seconds and answer a 
 NTFS drive by reading the drive's file table, or any folder by walking it, and then searches the
 result.
 
-- A real Windows drive with 1.35 million files and folders: indexed in 3.7 seconds, 97 MB of
-  memory, and a search answered in 5.7 ms. Measured in CI on GitHub's Windows runner.
+- A real Windows drive with 1.35 million files and folders: indexed in 3.5 seconds once Windows
+  has the file table in memory (36 seconds on the first read from the CI machine's cloud disk),
+  97 MB of memory, and a search answered in 5.2 ms. Measured in CI on GitHub's Windows runner.
 - A made-up drive with 1.1 million entries: every test search answered in under 12 ms on a
   2-core cloud VM.
 

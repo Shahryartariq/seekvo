@@ -57,8 +57,8 @@ jobs:
           cargo build --release --quiet
           first=$(./target/release/seekvo-engine drive C system32 --limit 5)
           echo "$first"
-          echo "::notice title=NTFS drive, first read::$(echo "$first" | head -n 1)"
+          echo "::notice title=NTFS drive first read::$(echo "$first" | head -n 1)"
           again=$(./target/release/seekvo-engine drive C system32 --limit 5)
           echo "$again"
-          echo "::notice title=NTFS drive, read again::$(echo "$again" | head -n 1)"
+          echo "::notice title=NTFS drive read again::$(echo "$again" | head -n 1)"
       - run: cargo test

@@ -9,7 +9,8 @@ app itself.
 - **Search** across that index: several words in any order, any letter case, and an `ext:` filter.
 - **A whole-drive reader for NTFS.** It asks Windows for the drive's file table in bulk instead of
   walking folders. On a real Windows drive with 1.35 million files and folders it built the index
-  in 3.7 seconds.
+  in 3.5 seconds once Windows had the file table in memory, and in 36 seconds on the first read
+  from a slow cloud disk.
 - **A folder scanner** that fills the index by walking a folder. It runs on Windows, macOS and
   Linux and needs no special rights.
 - **A command-line tool** to try it on your own drive and folders and to run the benchmark.
@@ -80,16 +81,23 @@ several hard links is listed under one of its names.
 
 ### A real drive
 
-Measured in CI on GitHub's hosted Windows runner (`drive C`, release build):
+Measured in CI on GitHub's hosted Windows runner (`drive C`, release build). The drive is C:,
+NTFS, with 1,136,632 files and 208,527 folders.
 
-| | |
-| --- | --- |
-| Drive | C:, NTFS, 1,136,635 files and 208,527 folders |
-| Time to index the whole drive | 3.7 seconds |
-| Memory held by the index | 97 MB |
-| Search for `system32` (723 matches) | 5.7 ms |
+| | First read | Read again |
+| --- | ---: | ---: |
+| Reading the file table from the drive | 35.0 s | 2.8 s |
+| Arranging the records into the index | 0.7 s | 0.7 s |
+| **Total** | **35.6 s** | **3.5 s** |
 
-Every pull request repeats this run, and the result line is attached to the CI run as a notice.
+The index holds 97 MB of memory, and a search for `system32` (723 matches) took 5.2 ms.
+
+The first read has to pull about 1.3 GB of file table off the disk, and the runner's disk is a
+cloud virtual disk. Once Windows has the table in its cache, as it does on a PC that has been in
+use, a read takes a few seconds. It has not been measured on a PC with a local SSD yet.
+
+Every pull request repeats both reads, and the result lines are attached to the CI run as
+notices.
 
 ### A made-up drive
 
