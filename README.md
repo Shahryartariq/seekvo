@@ -38,10 +38,16 @@ Goal for the first release: index a 1 TB drive in under 10 seconds and answer a 
 
 ## The engine
 
-`engine/` is the file index and search engine, in Rust. It already indexes a folder and searches
-it from the command line. On a made-up drive with 1.1 million entries it answers a search in
-under 12 ms on a 2-core cloud VM, using 53 MB of memory. Reading a whole NTFS drive directly is
-the next step. Details, benchmark and how to run it: [engine/README.md](engine/README.md).
+`engine/` is the file index and search engine, in Rust. From the command line it indexes a whole
+NTFS drive by reading the drive's file table, or any folder by walking it, and then searches the
+result.
+
+- A real Windows drive with 1.35 million files and folders: indexed in 3.7 seconds, 97 MB of
+  memory, and a search answered in 5.7 ms. Measured in CI on GitHub's Windows runner.
+- A made-up drive with 1.1 million entries: every test search answered in under 12 ms on a
+  2-core cloud VM.
+
+Details, benchmark and how to run it: [engine/README.md](engine/README.md).
 
 ## The landing page
 
