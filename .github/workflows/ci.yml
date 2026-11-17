@@ -47,18 +47,21 @@ jobs:
         run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       # Hosted Windows runners are administrators, so this reads a real
-      # NTFS drive. It runs before the tests so the first read is of a
-      # drive nothing has warmed up; the second read shows the difference.
-      # Each result line is kept as a notice on the run.
+      # NTFS drive, with each reader, twice. It runs before the tests so the
+      # first reads are of a drive nothing has warmed up. Each result line
+      # is kept as a notice on the run.
       - if: runner.os == 'Windows'
         name: Index the runner's system drive
         shell: bash
         run: |
           cargo build --release --quiet
-          first=$(./target/release/seekvo-engine drive C system32 --limit 5)
-          echo "$first"
-          echo "::notice title=NTFS drive first read::$(echo "$first" | head -n 1)"
-          again=$(./target/release/seekvo-engine drive C system32 --limit 5)
-          echo "$again"
-          echo "::notice title=NTFS drive read again::$(echo "$again" | head -n 1)"
+          index_drive() {
+            out=$(./target/release/seekvo-engine drive C system32 --limit 5 --reader "$1")
+            echo "$out"
+            echo "::notice title=$2::$(echo "$out" | head -n 1)"
+          }
+          index_drive table "File table first read"
+          index_drive records "Records from Windows first read"
+          index_drive table "File table read again"
+          index_drive records "Records from Windows read again"
       - run: cargo test

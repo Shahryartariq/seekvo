@@ -10,6 +10,7 @@
 //! - [`synthetic`] builds a made-up drive of any size for benchmarks.
 
 pub mod index;
+pub mod mft;
 pub mod ntfs;
 pub mod query;
 pub mod scan;

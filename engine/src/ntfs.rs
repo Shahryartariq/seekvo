@@ -9,15 +9,18 @@
 //! names its parent by number. [`build_index`] sorts that out. It is plain
 //! Rust and runs anywhere; only [`read_volume`] needs Windows.
 //!
-//! Known gaps: file sizes are not part of these records, so every size is
-//! zero for now, and a file with several hard links is listed under one of
-//! its names only.
+//! There are two ways to get the records. [`read_file_table`] reads the
+//! table directly (see [`crate::mft`]); it gives file sizes and every name
+//! of a hard-linked file. [`read_records`] asks Windows for a summary of
+//! each record instead; that has no sizes and one name per file, but it
+//! comes out of the system's cache when the drive was read recently.
 
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::io;
 
 use crate::index::{BuildError, EntryId, Index, IndexBuilder, Kind};
+use crate::mft::{FileTable, MftError};
 
 /// The low 48 bits of a file reference are the record's number in the
 /// table. The high 16 bits count how often that slot has been reused.
@@ -37,6 +40,7 @@ struct Row {
     name_start: usize,
     name_len: u32,
     is_dir: bool,
+    size: u64,
 }
 
 /// File records as they come off a drive: unordered, each naming its parent
@@ -68,7 +72,7 @@ impl VolumeRecords {
         self.push_row(file_reference, parent_reference, name_start, is_dir);
     }
 
-    fn push_utf16(
+    pub(crate) fn push_utf16(
         &mut self,
         file_reference: u64,
         parent_reference: u64,
@@ -99,6 +103,21 @@ impl VolumeRecords {
             name_start,
             name_len,
             is_dir,
+            size: 0,
+        });
+    }
+
+    /// Fill in what the rows could not know when they were added. `lookup`
+    /// gets a record number and returns whether it is a folder and its
+    /// size, or `None` to drop every row for that record.
+    pub(crate) fn resolve(&mut self, lookup: impl Fn(u64) -> Option<(bool, u64)>) {
+        self.rows.retain_mut(|row| match lookup(row.record) {
+            Some((is_dir, size)) => {
+                row.is_dir = is_dir;
+                row.size = size;
+                true
+            }
+            None => false,
         });
     }
 
@@ -221,7 +240,7 @@ pub fn build_index(
                 stats.dirs += 1;
                 queue.push_back((row.record, id));
             } else {
-                builder.add(Some(folder_id), records.name(row), Kind::File, 0)?;
+                builder.add(Some(folder_id), records.name(row), Kind::File, row.size)?;
                 stats.files += 1;
             }
             placed += 1;
@@ -244,6 +263,8 @@ pub enum VolumeError {
     /// Windows only lets administrators read a drive's file table.
     NeedsAdmin,
     Io(io::Error),
+    /// The file table could not be read directly.
+    Table(MftError),
     Build(BuildError),
 }
 
@@ -263,6 +284,7 @@ impl fmt::Display for VolumeError {
                  run this from an administrator terminal"
             ),
             VolumeError::Io(error) => write!(f, "cannot read the drive: {error}"),
+            VolumeError::Table(error) => write!(f, "{error}"),
             VolumeError::Build(error) => write!(f, "cannot build the index: {error}"),
         }
     }
@@ -270,10 +292,33 @@ impl fmt::Display for VolumeError {
 
 impl std::error::Error for VolumeError {}
 
-/// Read every file record from an NTFS drive, given its letter.
+/// Read an NTFS drive's file table directly, given the drive's letter.
 ///
-/// This is the part that talks to the disk. Needs Windows and an
-/// administrator. Everywhere else it returns [`VolumeError::Unsupported`].
+/// This gives file sizes and every name of a hard-linked file. Needs
+/// Windows and an administrator. Everywhere else it returns
+/// [`VolumeError::Unsupported`].
+///
+/// The drive is read below the file system, so a file created in the last
+/// few seconds may not have reached the table on disk yet.
+pub fn read_file_table(drive: char) -> Result<FileTable, VolumeError> {
+    if !drive.is_ascii_alphabetic() {
+        return Err(VolumeError::BadDrive(drive));
+    }
+    #[cfg(windows)]
+    {
+        windows::read_file_table(drive.to_ascii_uppercase())
+    }
+    #[cfg(not(windows))]
+    {
+        Err(VolumeError::Unsupported)
+    }
+}
+
+/// Ask Windows for a summary of every file record on an NTFS drive, given
+/// its letter.
+///
+/// No sizes, and one name per file. Needs Windows and an administrator.
+/// Everywhere else it returns [`VolumeError::Unsupported`].
 pub fn read_records(drive: char) -> Result<VolumeRecords, VolumeError> {
     if !drive.is_ascii_alphabetic() {
         return Err(VolumeError::BadDrive(drive));
@@ -288,12 +333,12 @@ pub fn read_records(drive: char) -> Result<VolumeRecords, VolumeError> {
     }
 }
 
-/// Index every file on an NTFS drive, given its letter: [`read_records`]
-/// followed by [`build_index`].
+/// Index every file on an NTFS drive, given its letter:
+/// [`read_file_table`] followed by [`build_index`].
 pub fn read_volume(drive: char) -> Result<(Index, VolumeStats), VolumeError> {
-    let records = read_records(drive)?;
+    let table = read_file_table(drive)?;
     let root = format!("{}:\\", drive.to_ascii_uppercase());
-    build_index(&root, &records).map_err(VolumeError::Build)
+    build_index(&root, &table.records).map_err(VolumeError::Build)
 }
 
 // `seekvo_check_windows` lets the Windows code be type-checked on other
@@ -306,6 +351,7 @@ mod windows {
     use std::ptr;
 
     use super::{VolumeError, VolumeRecords, parse_usn_buffer};
+    use crate::mft::{self, BlockSource, FileTable};
 
     type Handle = *mut c_void;
 
@@ -318,6 +364,9 @@ mod windows {
     const FSCTL_ENUM_USN_DATA: u32 = 0x0009_00B3;
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_HANDLE_EOF: i32 = 38;
+    const FILE_BEGIN: u32 = 0;
+    /// The most to ask `ReadFile` for at once; a whole number of sectors.
+    const READ_LIMIT: usize = 1 << 30;
     /// Each call fills up to this much with records.
     const BUFFER_BYTES: usize = 1 << 20;
 
@@ -364,6 +413,21 @@ mod windows {
             file_system_name_size: u32,
         ) -> i32;
 
+        fn SetFilePointerEx(
+            file: Handle,
+            distance_to_move: i64,
+            new_file_pointer: *mut i64,
+            move_method: u32,
+        ) -> i32;
+
+        fn ReadFile(
+            file: Handle,
+            buffer: *mut c_void,
+            bytes_to_read: u32,
+            bytes_read: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+
         fn CloseHandle(object: Handle) -> i32;
     }
 
@@ -376,6 +440,42 @@ mod windows {
             unsafe {
                 CloseHandle(self.0);
             }
+        }
+    }
+
+    impl BlockSource for Volume {
+        fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+            let distance =
+                i64::try_from(offset).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            // SAFETY: the handle is open, and the optional output is null.
+            if unsafe { SetFilePointerEx(self.0, distance, ptr::null_mut(), FILE_BEGIN) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut done = 0usize;
+            while done < buffer.len() {
+                let rest = &mut buffer[done..];
+                let want = rest.len().min(READ_LIMIT) as u32;
+                let mut got = 0u32;
+                // SAFETY: `rest` is writable for `want` bytes and lives
+                // across the call; no overlapped I/O is used.
+                let ok = unsafe {
+                    ReadFile(
+                        self.0,
+                        rest.as_mut_ptr().cast(),
+                        want,
+                        &mut got,
+                        ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if got == 0 {
+                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                }
+                done += got as usize;
+            }
+            Ok(())
         }
     }
 
@@ -411,7 +511,8 @@ mod windows {
         Ok(String::from_utf16_lossy(&name[..length]))
     }
 
-    pub(super) fn read_records(drive: char) -> Result<VolumeRecords, VolumeError> {
+    /// Open a drive for reading, after checking it is NTFS.
+    fn open(drive: char) -> Result<Volume, VolumeError> {
         let root = format!("{drive}:\\");
         let file_system = file_system_of(&root).map_err(VolumeError::Io)?;
         if file_system != "NTFS" {
@@ -440,7 +541,16 @@ mod windows {
                 VolumeError::Io(error)
             });
         }
-        let volume = Volume(handle);
+        Ok(Volume(handle))
+    }
+
+    pub(super) fn read_file_table(drive: char) -> Result<FileTable, VolumeError> {
+        let mut volume = open(drive)?;
+        mft::read_file_table(&mut volume).map_err(VolumeError::Table)
+    }
+
+    pub(super) fn read_records(drive: char) -> Result<VolumeRecords, VolumeError> {
+        let volume = open(drive)?;
 
         let mut records = VolumeRecords::new();
         // u64 elements keep the buffer aligned for the records Windows
@@ -752,58 +862,125 @@ mod tests {
         assert!(matches!(read_volume('C'), Err(VolumeError::Unsupported)));
     }
 
-    /// The real thing: read the drive Windows is installed on. Needs an
-    /// administrator, so it steps aside when it is not one.
     #[cfg(windows)]
-    #[test]
-    fn reads_the_system_drive() {
-        use crate::index::Kind;
-        use std::fs;
-
-        let drive = std::env::var("SystemDrive")
+    fn system_drive() -> char {
+        std::env::var("SystemDrive")
             .ok()
             .and_then(|value| value.chars().next())
-            .unwrap_or('C');
+            .unwrap_or('C')
+    }
 
-        // A fresh file with a name nothing else has.
-        let marker_name = format!("seekvo-ntfs-test-{}.marker", std::process::id());
-        let marker = std::env::temp_dir().join(&marker_name);
-        fs::write(&marker, "x").unwrap();
-        let marker_path = fs::canonicalize(&marker).unwrap();
-        let on_system_drive = marker_path
-            .to_string_lossy()
+    /// A path as the index shows it: no `\\?\` prefix, lowercase.
+    #[cfg(windows)]
+    fn plain(path: &std::path::Path) -> String {
+        path.to_string_lossy()
             .trim_start_matches(r"\\?\")
-            .to_uppercase()
-            .starts_with(drive.to_ascii_uppercase());
+            .to_lowercase()
+    }
 
-        let outcome = read_volume(drive);
-        let _ = fs::remove_file(&marker);
-        let (index, stats) = match outcome {
-            Ok(found) => found,
+    #[cfg(windows)]
+    fn assert_looks_like_windows(index: &Index, stats: &VolumeStats, drive: char) {
+        use crate::index::Kind;
+
+        assert!(stats.files > 10_000, "{stats:?}");
+        assert!(stats.dirs > 1_000, "{stats:?}");
+        let system32 = format!("{drive}:\\windows\\system32").to_lowercase();
+        let folders = index.search(&Query::parse("system32"), 10_000);
+        assert!(folders.hits.iter().any(|&id| {
+            index.kind(id) == Some(Kind::Dir) && index.path(id).unwrap().to_lowercase() == system32
+        }));
+    }
+
+    /// The real thing: read the file table of the drive Windows is
+    /// installed on, and compare sizes with what Windows itself reports.
+    /// Needs an administrator, so it steps aside when it is not one.
+    #[cfg(windows)]
+    #[test]
+    fn reads_the_system_drives_file_table() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let drive = system_drive();
+        let table = match read_file_table(drive) {
+            Ok(table) => table,
             Err(VolumeError::NeedsAdmin) => {
                 eprintln!("skipped: reading the file table needs an administrator");
                 return;
             }
             Err(other) => panic!("{other}"),
         };
+        let (index, stats) = build_index(&format!("{drive}:\\"), &table.records).unwrap();
+        assert_looks_like_windows(&index, &stats, drive);
 
-        assert!(stats.files > 10_000, "{stats:?}");
-        assert!(stats.dirs > 1_000, "{stats:?}");
+        // Files that have been on the drive since Windows was installed,
+        // so they are certainly in the table on disk.
+        let windows = PathBuf::from(format!("{drive}:\\Windows"));
+        let known = [
+            windows.join("explorer.exe"),
+            windows.join("System32").join("kernel32.dll"),
+            windows.join("System32").join("ntdll.dll"),
+            windows
+                .join("System32")
+                .join("drivers")
+                .join("etc")
+                .join("services"),
+            windows.join("win.ini"),
+        ];
+        let mut compared = 0;
+        for path in known {
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
+            let wanted = plain(&path);
+            let hits = index.search(&Query::parse(&name), usize::MAX);
+            let found = hits
+                .hits
+                .iter()
+                .find(|&&id| index.path(id).unwrap().to_lowercase() == wanted)
+                .unwrap_or_else(|| panic!("{wanted} is missing from the index"));
+            assert_eq!(index.size(*found), Some(metadata.len()), "{wanted}");
+            compared += 1;
+        }
+        assert!(compared >= 3, "only {compared} known files exist here");
+    }
 
-        let system32 = format!("{drive}:\\windows\\system32").to_lowercase();
-        let folders = index.search(&Query::parse("system32"), 10_000);
-        assert!(folders.hits.iter().any(|&id| {
-            index.kind(id) == Some(Kind::Dir) && index.path(id).unwrap().to_lowercase() == system32
-        }));
+    /// The other way in: ask Windows for the records. This goes through
+    /// the file system, so a file made a moment ago is already there.
+    #[cfg(windows)]
+    #[test]
+    fn asks_windows_for_the_system_drives_records() {
+        use std::fs;
+
+        let drive = system_drive();
+
+        // A fresh file with a name nothing else has.
+        let marker_name = format!("seekvo-ntfs-test-{}.marker", std::process::id());
+        let marker = std::env::temp_dir().join(&marker_name);
+        fs::write(&marker, "x").unwrap();
+        let marker_path = plain(&fs::canonicalize(&marker).unwrap());
+        let on_system_drive = marker_path.starts_with(drive.to_ascii_lowercase());
+
+        let outcome = read_records(drive);
+        let _ = fs::remove_file(&marker);
+        let records = match outcome {
+            Ok(records) => records,
+            Err(VolumeError::NeedsAdmin) => {
+                eprintln!("skipped: reading the file table needs an administrator");
+                return;
+            }
+            Err(other) => panic!("{other}"),
+        };
+        let (index, stats) = build_index(&format!("{drive}:\\"), &records).unwrap();
+        assert_looks_like_windows(&index, &stats, drive);
 
         if on_system_drive {
-            let wanted = marker_path
-                .to_string_lossy()
-                .trim_start_matches(r"\\?\")
-                .to_lowercase();
             let found = index.search(&Query::parse(&marker_name), 10);
             assert_eq!(found.total, 1);
-            assert_eq!(index.path(found.hits[0]).unwrap().to_lowercase(), wanted);
+            assert_eq!(
+                index.path(found.hits[0]).unwrap().to_lowercase(),
+                marker_path
+            );
         }
     }
 }

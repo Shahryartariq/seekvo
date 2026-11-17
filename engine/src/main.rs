@@ -5,20 +5,28 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use seekvo_engine::{Index, Query, Scope, ntfs, scan, synthetic};
+use seekvo_engine::{Index, Kind, Query, Scope, mft, ntfs, scan, synthetic};
 
 const USAGE: &str = "\
 Usage:
   seekvo-engine drive <letter> [words...] [--path] [--limit N]
+                      [--reader table|records]
       Index a whole NTFS drive from its file table, then search it.
       Windows only, from an administrator terminal.
+      --reader table (the default) reads the table off the drive, with
+      file sizes. --reader records asks Windows for a summary of each
+      record instead: no sizes, but quick when Windows has the drive's
+      table in memory already.
+  seekvo-engine image <file> [words...] [--path] [--limit N]
+      Index an NTFS volume saved as an image file, then search it.
+      Works anywhere.
   seekvo-engine scan <folder> [words...] [--path] [--limit N]
       Index a folder by walking it, then search it. Works anywhere.
   seekvo-engine bench [--files N]
       Build a made-up drive (one million files unless told otherwise)
       and time a set of searches on it.
 
-With no words, drive and scan only print the index numbers.
+With no words, drive, image and scan only print the index numbers.
 
 Search words:
   All words must match, in any order and any letter case.
@@ -37,6 +45,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let outcome = match args.first().map(String::as_str) {
         Some("drive") => run_drive(&args[1..]),
+        Some("image") => run_image(&args[1..]),
         Some("scan") => run_scan(&args[1..]),
         Some("bench") => run_bench(&args[1..]),
         Some("help" | "--help" | "-h") | None => {
@@ -58,12 +67,20 @@ fn main() -> ExitCode {
     }
 }
 
-/// What `drive` and `scan` take after the command name.
+/// How `drive` gets a drive's file records.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reader {
+    Table,
+    Records,
+}
+
+/// What `drive`, `image` and `scan` take after the command name.
 struct Target<'a> {
-    /// The drive letter or the folder.
+    /// The drive letter, the image file or the folder.
     place: &'a str,
     query: Query,
     limit: usize,
+    reader: Reader,
 }
 
 fn parse_target<'a>(args: &'a [String], what: &str) -> Result<Target<'a>, Stop> {
@@ -71,12 +88,20 @@ fn parse_target<'a>(args: &'a [String], what: &str) -> Result<Target<'a>, Stop> 
     let mut words: Vec<&str> = Vec::new();
     let mut scope = Scope::Smart;
     let mut limit = 20usize;
+    let mut reader = Reader::Table;
 
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--path" => scope = Scope::Path,
             "--limit" => limit = number_after(&mut rest, "--limit")?,
+            "--reader" => {
+                reader = match rest.next().map(String::as_str) {
+                    Some("table") => Reader::Table,
+                    Some("records") => Reader::Records,
+                    _ => return Err(Stop::Usage("--reader needs table or records".to_owned())),
+                }
+            }
             other if place.is_none() => place = Some(other),
             other => words.push(other),
         }
@@ -85,6 +110,7 @@ fn parse_target<'a>(args: &'a [String], what: &str) -> Result<Target<'a>, Stop> 
         place: place.ok_or_else(|| Stop::Usage(format!("this command needs {what}")))?,
         query: Query::parse(&words.join(" ")).with_scope(scope),
         limit,
+        reader,
     })
 }
 
@@ -103,27 +129,70 @@ fn run_drive(args: &[String]) -> Result<(), Stop> {
 
     let letter = letter.to_ascii_uppercase();
     let started = Instant::now();
-    let records = ntfs::read_records(letter).map_err(|e| Stop::Failed(e.to_string()))?;
+    let (records, damaged) = match target.reader {
+        Reader::Table => {
+            let table = ntfs::read_file_table(letter).map_err(|e| Stop::Failed(e.to_string()))?;
+            (table.records, table.damaged)
+        }
+        Reader::Records => {
+            let records = ntfs::read_records(letter).map_err(|e| Stop::Failed(e.to_string()))?;
+            (records, 0)
+        }
+    };
     let read = started.elapsed();
     let (index, stats) = ntfs::build_index(&format!("{letter}:\\"), &records)
         .map_err(|e| Stop::Failed(e.to_string()))?;
     let total = started.elapsed();
     drop(records);
     println!(
-        "Indexed {} files and {} folders on {}: in {} ({} reading the drive, {} arranging; {} of memory).",
+        "Indexed {} files and {} folders on {}: in {} ({} reading the {}, {} arranging; {} of memory).",
         group(stats.files),
         group(stats.dirs),
         letter,
         millis(total),
         millis(read),
+        match target.reader {
+            Reader::Table => "file table",
+            Reader::Records => "records from Windows",
+        },
         millis(total - read),
         megabytes(index.memory_bytes()),
     );
+    if damaged > 0 {
+        println!(
+            "Skipped {} records that were being written.",
+            group(damaged)
+        );
+    }
     if stats.unreachable > 0 {
         println!(
             "Left out {} records with no reachable folder.",
             group(stats.unreachable)
         );
+    }
+    search_and_print(&index, &target);
+    Ok(())
+}
+
+fn run_image(args: &[String]) -> Result<(), Stop> {
+    let target = parse_target(args, "an image file")?;
+    let mut file = std::fs::File::open(target.place)
+        .map_err(|e| Stop::Failed(format!("cannot open {}: {e}", target.place)))?;
+
+    let started = Instant::now();
+    let table = mft::read_file_table(&mut file).map_err(|e| Stop::Failed(e.to_string()))?;
+    let (index, stats) = ntfs::build_index(std::path::MAIN_SEPARATOR_STR, &table.records)
+        .map_err(|e| Stop::Failed(e.to_string()))?;
+    let took = started.elapsed();
+    println!(
+        "Indexed {} files and {} folders in {} ({} of memory).",
+        group(stats.files),
+        group(stats.dirs),
+        millis(took),
+        megabytes(index.memory_bytes()),
+    );
+    if table.damaged > 0 {
+        println!("Skipped {} damaged records.", group(table.damaged));
     }
     search_and_print(&index, &target);
     Ok(())
@@ -159,8 +228,12 @@ fn search_and_print(index: &Index, target: &Target) {
     let took = started.elapsed();
     println!("{} matches in {}.", group(result.total), millis(took));
     for &id in &result.hits {
-        if let Some(path) = index.path(id) {
-            println!("  {path}");
+        let Some(path) = index.path(id) else {
+            continue;
+        };
+        match (index.kind(id), index.size(id)) {
+            (Some(Kind::File), Some(size)) => println!("  {path}  ({})", file_size(size)),
+            _ => println!("  {path}"),
         }
     }
     if result.total > result.hits.len() {
@@ -262,6 +335,24 @@ fn millis(duration: Duration) -> String {
 
 fn megabytes(bytes: usize) -> String {
     format!("{:.0} MB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// 1536 -> "1.5 KB"
+fn file_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["bytes", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} bytes")
+    } else if value >= 100.0 {
+        format!("{value:.0} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// 1234567 -> "1,234,567"
