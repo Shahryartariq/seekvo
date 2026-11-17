@@ -6,8 +6,9 @@ own PC.
 
 **Live site: [seekvo.vercel.app](https://seekvo.vercel.app)**
 
-**Status: in development. There is no download yet.** This repository currently holds the landing
-page, which includes a working search demo over a sample drive.
+**Status: in development. There is no download yet.** This repository holds the landing page,
+with a working search demo over a sample drive, and the first piece of the app: the
+[search engine](engine/), written in Rust.
 
 ![The Seekvo landing page: a search field over a sample drive, with matches highlighted](docs/search.png)
 
@@ -34,6 +35,13 @@ Everything runs on your machine. No account, no uploads, no usage tracking.
 
 Goal for the first release: index a 1 TB drive in under 10 seconds and answer a search in under
 50 ms.
+
+## The engine
+
+`engine/` is the file index and search engine, in Rust. It already indexes a folder and searches
+it from the command line. On a made-up drive with 1.1 million entries it answers a search in
+under 12 ms on a 2-core cloud VM, using 53 MB of memory. Reading a whole NTFS drive directly is
+the next step. Details, benchmark and how to run it: [engine/README.md](engine/README.md).
 
 ## The landing page
 
@@ -81,8 +89,8 @@ npm run build
 
 ## Planned app stack
 
-Rust for the indexing and search engine, Tauri for the Windows app, and local AI models through
-ONNX Runtime and llama.cpp. This may change as the build goes on.
+Rust for the indexing and search engine (started in `engine/`), Tauri for the Windows app, and
+local AI models through ONNX Runtime and llama.cpp. This may change as the build goes on.
 
 ## Author
 
