@@ -101,15 +101,22 @@ fn run_drive(args: &[String]) -> Result<(), Stop> {
     }
     .ok_or_else(|| Stop::Usage(format!("{} is not a drive letter", target.place)))?;
 
+    let letter = letter.to_ascii_uppercase();
     let started = Instant::now();
-    let (index, stats) = ntfs::read_volume(letter).map_err(|e| Stop::Failed(e.to_string()))?;
-    let took = started.elapsed();
+    let records = ntfs::read_records(letter).map_err(|e| Stop::Failed(e.to_string()))?;
+    let read = started.elapsed();
+    let (index, stats) = ntfs::build_index(&format!("{letter}:\\"), &records)
+        .map_err(|e| Stop::Failed(e.to_string()))?;
+    let total = started.elapsed();
+    drop(records);
     println!(
-        "Indexed {} files and {} folders on {}: in {} ({} of memory).",
+        "Indexed {} files and {} folders on {}: in {} ({} reading the drive, {} arranging; {} of memory).",
         group(stats.files),
         group(stats.dirs),
-        letter.to_ascii_uppercase(),
-        millis(took),
+        letter,
+        millis(total),
+        millis(read),
+        millis(total - read),
         megabytes(index.memory_bytes()),
     );
     if stats.unreachable > 0 {

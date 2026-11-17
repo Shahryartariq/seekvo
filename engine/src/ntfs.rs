@@ -270,22 +270,30 @@ impl fmt::Display for VolumeError {
 
 impl std::error::Error for VolumeError {}
 
-/// Index every file on an NTFS drive, given its letter.
+/// Read every file record from an NTFS drive, given its letter.
 ///
-/// Needs Windows and an administrator. Everywhere else it returns
-/// [`VolumeError::Unsupported`].
-pub fn read_volume(drive: char) -> Result<(Index, VolumeStats), VolumeError> {
+/// This is the part that talks to the disk. Needs Windows and an
+/// administrator. Everywhere else it returns [`VolumeError::Unsupported`].
+pub fn read_records(drive: char) -> Result<VolumeRecords, VolumeError> {
     if !drive.is_ascii_alphabetic() {
         return Err(VolumeError::BadDrive(drive));
     }
     #[cfg(windows)]
     {
-        windows::read_volume(drive.to_ascii_uppercase())
+        windows::read_records(drive.to_ascii_uppercase())
     }
     #[cfg(not(windows))]
     {
         Err(VolumeError::Unsupported)
     }
+}
+
+/// Index every file on an NTFS drive, given its letter: [`read_records`]
+/// followed by [`build_index`].
+pub fn read_volume(drive: char) -> Result<(Index, VolumeStats), VolumeError> {
+    let records = read_records(drive)?;
+    let root = format!("{}:\\", drive.to_ascii_uppercase());
+    build_index(&root, &records).map_err(VolumeError::Build)
 }
 
 // `seekvo_check_windows` lets the Windows code be type-checked on other
@@ -297,8 +305,7 @@ mod windows {
     use std::io;
     use std::ptr;
 
-    use super::{VolumeError, VolumeRecords, VolumeStats, build_index, parse_usn_buffer};
-    use crate::index::Index;
+    use super::{VolumeError, VolumeRecords, parse_usn_buffer};
 
     type Handle = *mut c_void;
 
@@ -404,7 +411,7 @@ mod windows {
         Ok(String::from_utf16_lossy(&name[..length]))
     }
 
-    pub(super) fn read_volume(drive: char) -> Result<(Index, VolumeStats), VolumeError> {
+    pub(super) fn read_records(drive: char) -> Result<VolumeRecords, VolumeError> {
         let root = format!("{drive}:\\");
         let file_system = file_system_of(&root).map_err(VolumeError::Io)?;
         if file_system != "NTFS" {
@@ -478,9 +485,7 @@ mod windows {
                 _ => break,
             }
         }
-        drop(volume);
-
-        build_index(&root, &records).map_err(VolumeError::Build)
+        Ok(records)
     }
 }
 
