@@ -4,8 +4,12 @@ Seekvo is a search and cleanup app for Windows. It finds any file as you type, s
 disk space went, clears out duplicate files, and tidies folders with an AI model that runs on your
 own PC.
 
+**Live site: [seekvo.vercel.app](https://seekvo.vercel.app)**
+
 **Status: in development. There is no download yet.** This repository currently holds the landing
 page, which includes a working search demo over a sample drive.
+
+![The Seekvo landing page: a search field over a sample drive, with matches highlighted](docs/search.png)
 
 ## What Seekvo will do
 
@@ -42,6 +46,8 @@ made-up file names, and reports how long each search took.
 | Disk map: squarified treemap layout | `src/lib/treemap.ts` |
 | Sample drive data | `src/lib/sample-files.ts`, `src/lib/sample-drive.ts` |
 | Page and components | `src/app/`, `src/components/` |
+
+![Disk map of a sample drive, each folder drawn to scale](docs/disk-map.png)
 
 ### Tech stack
 
