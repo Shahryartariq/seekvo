@@ -27,3 +27,23 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  engine:
+    name: engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    defaults:
+      run:
+        working-directory: engine
+    steps:
+      - uses: actions/checkout@v5
+      # The version matches engine/rust-toolchain.toml.
+      - run: rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
+      - if: runner.os == 'Linux'
+        run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
