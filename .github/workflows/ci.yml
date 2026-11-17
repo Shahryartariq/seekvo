@@ -47,3 +47,12 @@ jobs:
         run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      # Hosted Windows runners are administrators, so this reads a real
+      # NTFS drive. The first output line is kept as a notice on the run.
+      - if: runner.os == 'Windows'
+        name: Index the runner's system drive
+        shell: bash
+        run: |
+          out=$(cargo run --release --quiet -- drive C system32 --limit 5)
+          echo "$out"
+          echo "::notice title=NTFS drive::$(echo "$out" | head -n 1)"

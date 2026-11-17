@@ -5,44 +5,69 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use seekvo_engine::{Index, Query, Scope, scan, synthetic};
+use seekvo_engine::{Index, Query, Scope, ntfs, scan, synthetic};
 
 const USAGE: &str = "\
 Usage:
+  seekvo-engine drive <letter> [words...] [--path] [--limit N]
+      Index a whole NTFS drive from its file table, then search it.
+      Windows only, from an administrator terminal.
   seekvo-engine scan <folder> [words...] [--path] [--limit N]
-      Index a folder, then search it. With no words, only the index
-      numbers are printed.
+      Index a folder by walking it, then search it. Works anywhere.
   seekvo-engine bench [--files N]
       Build a made-up drive (one million files unless told otherwise)
       and time a set of searches on it.
+
+With no words, drive and scan only print the index numbers.
 
 Search words:
   All words must match, in any order and any letter case.
   ext:pdf keeps only files with that extension.
   --path also lists everything inside a folder whose name matches.";
 
+/// Why the tool stopped.
+enum Stop {
+    /// The command line was wrong; the usage text helps.
+    Usage(String),
+    /// The command was fine but the work failed.
+    Failed(String),
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let outcome = match args.first().map(String::as_str) {
+        Some("drive") => run_drive(&args[1..]),
         Some("scan") => run_scan(&args[1..]),
         Some("bench") => run_bench(&args[1..]),
         Some("help" | "--help" | "-h") | None => {
             println!("{USAGE}");
             Ok(())
         }
-        Some(other) => Err(format!("unknown command: {other}")),
+        Some(other) => Err(Stop::Usage(format!("unknown command: {other}"))),
     };
     match outcome {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
+        Err(Stop::Usage(message)) => {
             eprintln!("{message}\n\n{USAGE}");
+            ExitCode::FAILURE
+        }
+        Err(Stop::Failed(message)) => {
+            eprintln!("{message}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_scan(args: &[String]) -> Result<(), String> {
-    let mut folder: Option<&str> = None;
+/// What `drive` and `scan` take after the command name.
+struct Target<'a> {
+    /// The drive letter or the folder.
+    place: &'a str,
+    query: Query,
+    limit: usize,
+}
+
+fn parse_target<'a>(args: &'a [String], what: &str) -> Result<Target<'a>, Stop> {
+    let mut place: Option<&str> = None;
     let mut words: Vec<&str> = Vec::new();
     let mut scope = Scope::Smart;
     let mut limit = 20usize;
@@ -52,14 +77,57 @@ fn run_scan(args: &[String]) -> Result<(), String> {
         match arg.as_str() {
             "--path" => scope = Scope::Path,
             "--limit" => limit = number_after(&mut rest, "--limit")?,
-            other if folder.is_none() => folder = Some(other),
+            other if place.is_none() => place = Some(other),
             other => words.push(other),
         }
     }
-    let folder = folder.ok_or("scan needs a folder")?;
+    Ok(Target {
+        place: place.ok_or_else(|| Stop::Usage(format!("this command needs {what}")))?,
+        query: Query::parse(&words.join(" ")).with_scope(scope),
+        limit,
+    })
+}
+
+fn run_drive(args: &[String]) -> Result<(), Stop> {
+    let target = parse_target(args, "a drive letter")?;
+    // Accept "C", "c:" and "C:\".
+    let letter = match target
+        .place
+        .trim_end_matches(['\\', '/'])
+        .trim_end_matches(':')
+    {
+        one if one.chars().count() == 1 => one.chars().next(),
+        _ => None,
+    }
+    .ok_or_else(|| Stop::Usage(format!("{} is not a drive letter", target.place)))?;
 
     let started = Instant::now();
-    let (index, stats) = scan::scan_dir(Path::new(folder)).map_err(|e| e.to_string())?;
+    let (index, stats) = ntfs::read_volume(letter).map_err(|e| Stop::Failed(e.to_string()))?;
+    let took = started.elapsed();
+    println!(
+        "Indexed {} files and {} folders on {}: in {} ({} of memory).",
+        group(stats.files),
+        group(stats.dirs),
+        letter.to_ascii_uppercase(),
+        millis(took),
+        megabytes(index.memory_bytes()),
+    );
+    if stats.unreachable > 0 {
+        println!(
+            "Left out {} records with no reachable folder.",
+            group(stats.unreachable)
+        );
+    }
+    search_and_print(&index, &target);
+    Ok(())
+}
+
+fn run_scan(args: &[String]) -> Result<(), Stop> {
+    let target = parse_target(args, "a folder")?;
+
+    let started = Instant::now();
+    let (index, stats) =
+        scan::scan_dir(Path::new(target.place)).map_err(|e| Stop::Failed(e.to_string()))?;
     let took = started.elapsed();
     println!(
         "Indexed {} files and {} folders in {} ({} of memory).",
@@ -71,13 +139,16 @@ fn run_scan(args: &[String]) -> Result<(), String> {
     if stats.skipped > 0 {
         println!("Skipped {} that could not be read.", group(stats.skipped));
     }
+    search_and_print(&index, &target);
+    Ok(())
+}
 
-    let query = Query::parse(&words.join(" ")).with_scope(scope);
-    if query.is_empty() {
-        return Ok(());
+fn search_and_print(index: &Index, target: &Target) {
+    if target.query.is_empty() {
+        return;
     }
     let started = Instant::now();
-    let result = index.search(&query, limit);
+    let result = index.search(&target.query, target.limit);
     let took = started.elapsed();
     println!("{} matches in {}.", group(result.total), millis(took));
     for &id in &result.hits {
@@ -88,21 +159,20 @@ fn run_scan(args: &[String]) -> Result<(), String> {
     if result.total > result.hits.len() {
         println!("  (showing the first {})", result.hits.len());
     }
-    Ok(())
 }
 
-fn run_bench(args: &[String]) -> Result<(), String> {
+fn run_bench(args: &[String]) -> Result<(), Stop> {
     let mut files = 1_000_000usize;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--files" => files = number_after(&mut rest, "--files")?,
-            other => return Err(format!("unknown option: {other}")),
+            other => return Err(Stop::Usage(format!("unknown option: {other}"))),
         }
     }
 
     let started = Instant::now();
-    let index = synthetic::build(files).map_err(|e| e.to_string())?;
+    let index = synthetic::build(files).map_err(|e| Stop::Failed(e.to_string()))?;
     let built = started.elapsed();
     println!(
         "Made-up drive: {} entries, built in {}, {} of memory.",
@@ -164,12 +234,14 @@ fn time_search(index: &Index, query: &Query) -> (usize, Duration, Duration) {
 fn number_after<'a>(
     rest: &mut impl Iterator<Item = &'a String>,
     option: &str,
-) -> Result<usize, String> {
-    let value = rest.next().ok_or(format!("{option} needs a number"))?;
+) -> Result<usize, Stop> {
+    let value = rest
+        .next()
+        .ok_or_else(|| Stop::Usage(format!("{option} needs a number")))?;
     value
         .replace(['_', ','], "")
         .parse()
-        .map_err(|_| format!("{option} needs a number, got {value}"))
+        .map_err(|_| Stop::Usage(format!("{option} needs a number, got {value}")))
 }
 
 fn millis(duration: Duration) -> String {

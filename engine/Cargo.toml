@@ -10,6 +10,10 @@ publish = false
 [dependencies]
 memchr = "2"
 
+[lints.rust]
+# Set by hand to type-check the Windows-only code on another system.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(seekvo_check_windows)'] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
