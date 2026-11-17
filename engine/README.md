@@ -9,7 +9,7 @@ app itself.
 - **Search** across that index: several words in any order, any letter case, and an `ext:` filter.
 - **A whole-drive reader for NTFS.** It reads the drive's file table directly instead of walking
   folders, and gets every file's size and every name of a hard-linked file. On a real Windows
-  drive with 1.4 million files and folders the first read took under 10 seconds.
+  drive with 1.4 million files and folders the first read took about 10 seconds.
 - **An image reader.** The same code indexes an NTFS volume saved as an image file, on any
   system.
 - **A folder scanner** that fills the index by walking a folder. It runs on Windows, macOS and
@@ -102,13 +102,13 @@ Two things to know:
 ### A real drive
 
 Measured in CI on GitHub's hosted Windows runner (`drive C`, release build), on its C: drive:
-NTFS, 1,201,656 file names and 208,530 folders. Two runs on separate machines:
+NTFS, 1,201,656 file names and 208,530 folders. Three runs on separate machines:
 
 | | First read | Read again |
 | --- | ---: | ---: |
-| Reading the file table off the drive | 8.7 s and 9.0 s | 3.2 s and 5.8 s |
+| Reading the file table off the drive | 8.7, 9.0 and 11.0 s | 3.2, 5.8 and 3.2 s |
 | Arranging the records into the index | 0.8 s | 0.8 s |
-| **Total** | **9.5 s and 9.8 s** | **4.0 s and 6.5 s** |
+| **Total** | **9.5, 9.8 and 11.9 s** | **4.0, 6.5 and 4.0 s** |
 
 The index holds 102 MB of memory, and a search for `system32` (723 matches) took about 5 ms.
 
