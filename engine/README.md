@@ -7,16 +7,16 @@ app itself.
 
 - **An in-memory index** of files and folders: name, parent folder, size and extension.
 - **Search** across that index: several words in any order, any letter case, and an `ext:` filter.
-- **A whole-drive reader for NTFS.** It asks Windows for the drive's file table in bulk instead of
-  walking folders. On a real Windows drive with 1.35 million files and folders it built the index
-  in 3.5 seconds once Windows had the file table in memory, and in 36 seconds on the first read
-  from a slow cloud disk.
+- **A whole-drive reader for NTFS.** It reads the drive's file table directly instead of walking
+  folders, and gets every file's size and every name of a hard-linked file. On a real Windows
+  drive with 1.4 million files and folders the first read took about 10 seconds.
+- **An image reader.** The same code indexes an NTFS volume saved as an image file, on any
+  system.
 - **A folder scanner** that fills the index by walking a folder. It runs on Windows, macOS and
   Linux and needs no special rights.
-- **A command-line tool** to try it on your own drive and folders and to run the benchmark.
+- **A command-line tool** to try all of this and to run the benchmark.
 
-Not built yet: file sizes when reading a whole drive, following changes live, saving the index to
-disk, and ranking results.
+Not built yet: following changes live, saving the index to disk, and ranking results.
 
 ## Try it
 
@@ -31,6 +31,9 @@ cargo run --release -- drive C invoice 2026
 
 # Index one folder, then search it. Works anywhere, no administrator needed.
 cargo run --release -- scan C:\Users\you\Documents report ext:pdf
+
+# Index an NTFS volume saved as an image file. Works anywhere.
+cargo run --release -- image disk.img report ext:pdf
 
 # Time searches on a made-up drive with a million files
 cargo run --release -- bench
@@ -66,37 +69,55 @@ few thousand files and many queries.
 
 ### Reading a whole drive
 
-NTFS keeps one record per file in its Master File Table, and Windows will hand those records
-over a megabyte at a time (`FSCTL_ENUM_USN_DATA`). Each record has the file's name and the
-number of its parent folder, in table order rather than folder order. `src/ntfs.rs` sorts the
-records by parent and walks down from the top folder, so parents land in the index before their
-children. The parsing and the ordering are plain Rust and are tested on every system, including
-with damaged buffers and records that point at each other in a loop. Only four Windows calls
-are platform-specific.
+NTFS keeps one fixed-size record per file in its Master File Table, and the table is itself a
+file on the drive. `src/mft.rs` reads it without going through the file system:
 
-Two limits for now: these records carry no file sizes, so sizes read as zero, and a file with
-several hard links is listed under one of its names.
+1. The drive's first sector says where the table starts and how big a record is.
+2. The table's own first record lists the stretches of the drive it is stored in. On a
+   fragmented drive that list continues in further records, which the reader follows.
+3. Each record is checked (NTFS marks the end of every 512 bytes so a half-written record can be
+   told apart) and then read for its names, its parent folder and the size of its data.
+
+The records come out in table order, each naming its parent by number. `src/ntfs.rs` sorts them
+by parent and walks down from the top folder, so parents land in the index before their
+children.
+
+Everything read from the drive is treated as untrusted. A record that fails its check is
+skipped and counted. The tests run the reader on the file table of a real volume (formatted
+with `mkntfs`, filled through `ntfs-3g`; see `tests/fixtures/`), on a hand-made volume for cases
+a healthy one does not have, and on the real table with random bytes flipped, 400 times over,
+to check that damage produces an error or a shorter listing and never a crash. On Windows a
+further test reads the real system drive and compares file sizes with what Windows reports.
+
+Two things to know:
+
+- The drive is read below the file system, so a file created in the last few seconds may not
+  have reached the table on disk yet. Following the change journal, which is next, closes that
+  gap.
+- `--reader records` uses the earlier method, which asks Windows for a summary of each record
+  (`FSCTL_ENUM_USN_DATA`). It has no sizes and one name per file.
 
 ## Benchmark
 
 ### A real drive
 
-Measured in CI on GitHub's hosted Windows runner (`drive C`, release build). The drive is C:,
-NTFS, with 1,136,632 files and 208,527 folders.
+Measured in CI on GitHub's hosted Windows runner (`drive C`, release build), on its C: drive:
+NTFS, 1,201,656 file names and 208,530 folders. Three runs on separate machines:
 
 | | First read | Read again |
 | --- | ---: | ---: |
-| Reading the file table from the drive | 35.0 s | 2.8 s |
-| Arranging the records into the index | 0.7 s | 0.7 s |
-| **Total** | **35.6 s** | **3.5 s** |
+| Reading the file table off the drive | 8.7, 9.0 and 11.0 s | 3.2, 5.8 and 3.2 s |
+| Arranging the records into the index | 0.8 s | 0.8 s |
+| **Total** | **9.5, 9.8 and 11.9 s** | **4.0, 6.5 and 4.0 s** |
 
-The index holds 97 MB of memory, and a search for `system32` (723 matches) took 5.2 ms.
+The index holds 102 MB of memory, and a search for `system32` (723 matches) took about 5 ms.
 
-The first read has to pull about 1.3 GB of file table off the disk, and the runner's disk is a
-cloud virtual disk. Once Windows has the table in its cache, as it does on a PC that has been in
-use, a read takes a few seconds. It has not been measured on a PC with a local SSD yet.
+The runner's drive is a cloud virtual disk, and the table on it is about 1.4 GB. It has not been
+measured on a PC with a local SSD yet. The earlier reader (`--reader records`) took 36 to 42
+seconds when it was the first thing to read the same drive, and about 3.5 seconds once Windows
+had the table in memory.
 
-Every pull request repeats both reads, and the result lines are attached to the CI run as
+Every pull request repeats these reads, and the result lines are attached to the CI run as
 notices.
 
 ### A made-up drive
@@ -129,7 +150,7 @@ cargo test
 
 ## What comes next
 
-1. File sizes for whole-drive indexing, read from the file table itself.
-2. Follow the NTFS change journal, so new and renamed files show up without a rescan.
-3. Save the index to disk and load it at startup.
-4. Rank results, so the most likely file comes first.
+1. Follow the NTFS change journal, so new and renamed files show up without a rescan.
+2. Save the index to disk and load it at startup.
+3. Rank results, so the most likely file comes first.
+4. Add up folder sizes, which the disk map needs.
