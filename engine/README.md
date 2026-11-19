@@ -9,7 +9,8 @@ app itself.
 - **Search** across that index: several words in any order, any letter case, and an `ext:` filter.
 - **A whole-drive reader for NTFS.** It reads the drive's file table directly instead of walking
   folders, and gets every file's size and every name of a hard-linked file. On a real Windows
-  drive with 1.4 million files and folders the first read took 9 to 14 seconds.
+  drive with 1.4 million files and folders the first read took 9 to 14 seconds in eight runs
+  out of nine.
 - **Following changes.** After the first read the index follows the drive's change journal. A
   file that is created, renamed, moved, resized or deleted is in the index at the next poll,
   with no rescan.
@@ -153,15 +154,16 @@ Things to know:
 Measured in CI on GitHub's hosted Windows runner (release build), on its C: drive: NTFS, about
 1.2 million file names and 208,500 folders. Each run is on a separate machine.
 
-Reading the whole drive (`drive C`), eight runs:
+Reading the whole drive (`drive C`), nine runs:
 
 | | First read | Read again |
 | --- | ---: | ---: |
-| Reading the file table off the drive | 8.3 to 13.3 s | 3.2 to 5.8 s |
+| Reading the file table off the drive | 8.3 to 13.3 s in eight runs, 3.4 s in one | 3.2 to 5.8 s |
 | Arranging the records into the index | 0.7 to 1.0 s | 0.7 to 1.0 s |
-| **Total** | **9.0 to 14.2 s** (9.0, 9.5, 9.6, 9.8, 10.4, 11.9, 12.4, 14.2) | **4.0 to 6.5 s** |
+| **Total** | **9.0 to 14.2 s** in eight runs, 4.3 s in one | **4.0 to 6.5 s** |
 
-The index holds 102 MB of memory, and a search for `system32` (629 to 723 matches) took 4 to
+The one fast first read was as quick as a second read, so that runner had most likely read
+the table before the test began. The index holds 102 MB of memory, and a search for `system32` (629 to 723 matches) took 4 to
 5 ms.
 
 Following changes and starting from a saved index (`watch C --saved`), four or five runs each. The
