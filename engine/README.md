@@ -169,7 +169,7 @@ Following changes and starting from a saved index (`watch C --saved`), three or 
 | | |
 | --- | ---: |
 | Taking in a handful of changed files | 0.1 to 0.2 ms |
-| Rebuilding the index so they can be searched | 0.71 to 0.83 s |
+| Rebuilding the index so they can be searched | 0.71 to 0.90 s |
 | Saving the index (a 69 MB file) | 0.30 to 0.31 s |
 | Starting from the saved index, catching up included | 0.84 to 1.06 s over six starts |
 
