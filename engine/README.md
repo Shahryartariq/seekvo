@@ -14,7 +14,7 @@ app itself.
   file that is created, renamed, moved, resized or deleted is in the index at the next poll,
   with no rescan.
 - **A saved index.** The index can be written to a file. The next start loads it and catches up
-  from the change journal instead of reading the drive: under a second on the same drive.
+  from the change journal instead of reading the drive: about a second on the same drive.
 - **An image reader.** The same code indexes an NTFS volume saved as an image file, on any
   system.
 - **A folder scanner** that fills the index by walking a folder. It runs on Windows, macOS and
@@ -138,7 +138,7 @@ watching, changes more files, and starts again from the saved index.
 
 Things to know:
 
-- A change is searchable after the index is rebuilt, which took 0.7 to 0.8 seconds on the test
+- A change is searchable after the index is rebuilt, which took 0.7 to 0.9 seconds on the test
   drive. That is fine as a background step, but updating the index in place is the better
   design and comes next.
 - A drive changed by another system that does not write the journal (Linux writing to an NTFS
@@ -153,25 +153,25 @@ Things to know:
 Measured in CI on GitHub's hosted Windows runner (release build), on its C: drive: NTFS, about
 1.2 million file names and 208,500 folders. Each run is on a separate machine.
 
-Reading the whole drive (`drive C`), six runs:
+Reading the whole drive (`drive C`), seven runs:
 
 | | First read | Read again |
 | --- | ---: | ---: |
 | Reading the file table off the drive | 8.3 to 13.3 s | 3.2 to 5.8 s |
-| Arranging the records into the index | 0.7 to 0.8 s | 0.7 to 0.8 s |
-| **Total** | **9.0, 9.5, 9.8, 11.9, 12.4 and 14.2 s** | **4.0, 4.0, 4.1, 4.5, 5.0 and 6.5 s** |
+| Arranging the records into the index | 0.7 to 0.9 s | 0.7 to 0.9 s |
+| **Total** | **9.0 to 14.2 s** (9.0, 9.5, 9.8, 10.4, 11.9, 12.4, 14.2) | **4.0 to 6.5 s** |
 
 The index holds 102 MB of memory, and a search for `system32` (629 to 723 matches) took 4 to
 5 ms.
 
-Following changes and starting from a saved index (`watch C --saved`), two or three runs each:
+Following changes and starting from a saved index (`watch C --saved`), three or four runs each:
 
 | | |
 | --- | ---: |
 | Taking in a handful of changed files | 0.1 to 0.2 ms |
 | Rebuilding the index so they can be searched | 0.71 to 0.83 s |
-| Saving the index (68.7 MB file) | 0.30 to 0.31 s |
-| Starting from the saved index, catching up included | 0.84 to 0.90 s over four starts |
+| Saving the index (a 69 MB file) | 0.30 to 0.31 s |
+| Starting from the saved index, catching up included | 0.84 to 1.06 s over six starts |
 
 The start from the saved index was timed right after the file was written, so Windows still had
 it in memory, and only a few files had changed in between. A start after a restart, or after a
