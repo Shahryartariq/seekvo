@@ -18,6 +18,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io;
+use std::path::Path;
+use std::time::Duration;
 
 use crate::index::{BuildError, EntryId, Index, IndexBuilder, Kind};
 use crate::live::LiveError;
@@ -64,9 +66,44 @@ pub struct VolumeRecords {
     dead: usize,
 }
 
+/// One current row of a [`VolumeRecords`], for reading it back out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordRow<'a> {
+    pub record: u64,
+    /// Record number of the folder it is in.
+    pub parent: u64,
+    pub name: &'a str,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
 impl VolumeRecords {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Empty, with room set aside for `rows` rows and `name_bytes` bytes
+    /// of names.
+    pub(crate) fn with_room(rows: usize, name_bytes: usize) -> Self {
+        VolumeRecords {
+            names: String::with_capacity(name_bytes),
+            rows: Vec::with_capacity(rows),
+            ..Self::default()
+        }
+    }
+
+    /// Every current row. A file with two names appears twice.
+    pub fn iter(&self) -> impl Iterator<Item = RecordRow<'_>> {
+        self.rows
+            .iter()
+            .filter(|row| !row.dead)
+            .map(|row| RecordRow {
+                record: row.record,
+                parent: row.parent,
+                name: self.name(row),
+                is_dir: row.is_dir,
+                size: row.size,
+            })
     }
 
     /// Number of rows that are still current. A file with two names has two.
@@ -532,6 +569,17 @@ pub struct LiveDrive {
     never: std::convert::Infallible,
 }
 
+/// Where a [`LiveDrive`]'s index came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    /// Loaded from the saved file, then brought up to date from the
+    /// drive's change journal. The drive itself was not read.
+    FromSaved,
+    /// Read from the drive in full, because the saved file could not be
+    /// used. Says why.
+    ReadInFull(String),
+}
+
 impl LiveDrive {
     /// Read a drive, given its letter, and start following it.
     pub fn open(drive: char) -> Result<Self, VolumeError> {
@@ -546,6 +594,79 @@ impl LiveDrive {
         #[cfg(not(windows))]
         {
             Err(VolumeError::Unsupported)
+        }
+    }
+
+    /// Start following a drive from an index [`save`](Self::save)d
+    /// earlier, without reading the drive.
+    ///
+    /// Everything that happened on the drive since the save is taken in
+    /// from its change journal. When the saved file is missing, damaged,
+    /// from another drive, or older than the journal goes back, the drive
+    /// is read in full instead, exactly as [`open`](Self::open) does.
+    pub fn open_saved(drive: char, saved: &Path) -> Result<(Self, Start), VolumeError> {
+        if !drive.is_ascii_alphabetic() {
+            return Err(VolumeError::BadDrive(drive));
+        }
+        #[cfg(windows)]
+        {
+            let drive = drive.to_ascii_uppercase();
+            let why = match std::fs::File::open(saved) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    "nothing has been saved yet".to_owned()
+                }
+                Err(error) => format!("the saved index cannot be opened: {error}"),
+                Ok(mut file) => match crate::snapshot::read(&mut file) {
+                    Err(error) => error.to_string(),
+                    Ok(saved) => match windows::resume(drive, saved)? {
+                        Ok(inner) => return Ok((LiveDrive { inner }, Start::FromSaved)),
+                        Err(why) => why.to_owned(),
+                    },
+                },
+            };
+            let inner = windows::follow(drive)?;
+            Ok((LiveDrive { inner }, Start::ReadInFull(why)))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = saved;
+            Err(VolumeError::Unsupported)
+        }
+    }
+
+    /// Save the index as it is now, for [`open_saved`](Self::open_saved).
+    ///
+    /// The file is written under another name first and then moved into
+    /// place, so a crash halfway leaves the previous save intact.
+    pub fn save(&self, saved: &Path) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            let origin = self.inner.volume().origin(self.inner.cursor());
+            let mut partial = saved.as_os_str().to_owned();
+            partial.push(".partial");
+            let partial = std::path::PathBuf::from(partial);
+            let mut file = std::fs::File::create(&partial)?;
+            crate::snapshot::write(&mut file, self.inner.records(), origin)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&partial, saved)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = saved;
+            match self.never {}
+        }
+    }
+
+    /// How long catching up took while opening.
+    pub fn caught_up_in(&self) -> Duration {
+        #[cfg(windows)]
+        {
+            self.inner.caught_up_in()
+        }
+        #[cfg(not(windows))]
+        {
+            match self.never {}
         }
     }
 
@@ -618,6 +739,7 @@ mod windows {
         Journal, JournalBatch, JournalError, Live, LiveError, RecordSource, filetime_now,
     };
     use crate::mft::{self, BlockSource, FileTable};
+    use crate::snapshot::{Origin, Saved};
 
     type Handle = *mut c_void;
 
@@ -734,8 +856,8 @@ mod windows {
         fn CloseHandle(object: Handle) -> i32;
     }
 
-    /// An open drive that closes itself.
-    struct Volume(Handle);
+    /// An open drive that closes itself, and its serial number.
+    struct Volume(Handle, u32);
 
     impl Drop for Volume {
         fn drop(&mut self) {
@@ -787,9 +909,11 @@ mod windows {
         text.encode_utf16().chain([0]).collect()
     }
 
-    fn file_system_of(root: &str) -> io::Result<String> {
+    /// The name of a drive's file system, and the drive's serial number.
+    fn file_system_of(root: &str) -> io::Result<(String, u32)> {
         let root = wide(root);
         let mut name = [0u16; 64];
+        let mut serial = 0u32;
         // SAFETY: `root` is NUL-terminated, `name` is writable for the
         // length passed, and the other outputs are allowed to be null.
         let ok = unsafe {
@@ -797,7 +921,7 @@ mod windows {
                 root.as_ptr(),
                 ptr::null_mut(),
                 0,
-                ptr::null_mut(),
+                &mut serial,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 name.as_mut_ptr(),
@@ -811,13 +935,13 @@ mod windows {
             .iter()
             .position(|&unit| unit == 0)
             .unwrap_or(name.len());
-        Ok(String::from_utf16_lossy(&name[..length]))
+        Ok((String::from_utf16_lossy(&name[..length]), serial))
     }
 
     /// Open a drive for reading, after checking it is NTFS.
     fn open(drive: char) -> Result<Volume, VolumeError> {
         let root = format!("{drive}:\\");
-        let file_system = file_system_of(&root).map_err(VolumeError::Io)?;
+        let (file_system, serial) = file_system_of(&root).map_err(VolumeError::Io)?;
         if file_system != "NTFS" {
             return Err(VolumeError::NotNtfs(file_system));
         }
@@ -844,7 +968,7 @@ mod windows {
                 VolumeError::Io(error)
             });
         }
-        Ok(Volume(handle))
+        Ok(Volume(handle, serial))
     }
 
     pub(super) fn read_file_table(drive: char) -> Result<FileTable, VolumeError> {
@@ -1030,26 +1154,77 @@ mod windows {
         Ok(data)
     }
 
-    /// Read a drive in full and start following its change journal.
-    pub(super) fn follow(drive: char) -> Result<Live<Followed>, VolumeError> {
-        let replay_since = filetime_now() - REPLAY_MARGIN;
-        let mut volume = open(drive)?;
-        let journal =
-            journal_of(&volume).map_err(|error| VolumeError::Live(LiveError::Journal(error)))?;
-        let table = mft::read_file_table(&mut volume).map_err(VolumeError::Table)?;
-        let followed = Followed {
+    impl Followed {
+        /// What to note in a saved index, so it is only ever used for this
+        /// drive and this journal.
+        pub(super) fn origin(&self, cursor: i64) -> Origin {
+            Origin {
+                volume_serial: self.volume.1,
+                journal_id: self.journal_id,
+                cursor,
+            }
+        }
+    }
+
+    fn followed(volume: Volume, journal: &JournalData) -> Followed {
+        Followed {
             volume,
             journal_id: journal.journal_id,
             record: vec![0u64; RECORD_BUFFER_BYTES / 8],
             journal: vec![0u64; BUFFER_BYTES / 8],
-        };
+        }
+    }
+
+    fn journal_or_error(volume: &Volume) -> Result<JournalData, VolumeError> {
+        journal_of(volume).map_err(|error| VolumeError::Live(LiveError::Journal(error)))
+    }
+
+    /// Read a drive in full and start following its change journal.
+    pub(super) fn follow(drive: char) -> Result<Live<Followed>, VolumeError> {
+        let replay_since = filetime_now() - REPLAY_MARGIN;
+        let mut volume = open(drive)?;
+        let journal = journal_or_error(&volume)?;
+        let table = mft::read_file_table(&mut volume).map_err(VolumeError::Table)?;
+        let root = format!("{drive}:\\");
         Live::start(
-            followed,
+            followed(volume, &journal),
             table.records,
-            &format!("{drive}:\\"),
+            &root,
             replay_since,
         )
         .map_err(VolumeError::Live)
+    }
+
+    /// Carry on from a saved index. The inner error says why the saved
+    /// index cannot be used for this drive as it is now.
+    pub(super) fn resume(
+        drive: char,
+        saved: Saved,
+    ) -> Result<Result<Live<Followed>, &'static str>, VolumeError> {
+        const TOO_OLD: &str = "the drive's change journal no longer goes back to the last save";
+        let volume = open(drive)?;
+        let journal = journal_or_error(&volume)?;
+        let origin = saved.origin;
+        if origin.volume_serial != volume.1 {
+            return Ok(Err("the saved index is from another drive"));
+        }
+        if origin.journal_id != journal.journal_id
+            || origin.cursor < journal.first_usn
+            || origin.cursor > journal.next_usn
+        {
+            return Ok(Err(TOO_OLD));
+        }
+        let root = format!("{drive}:\\");
+        match Live::resume(
+            followed(volume, &journal),
+            saved.records,
+            &root,
+            origin.cursor,
+        ) {
+            Ok(live) => Ok(Ok(live)),
+            Err(LiveError::Journal(JournalError::Expired)) => Ok(Err(TOO_OLD)),
+            Err(other) => Err(VolumeError::Live(other)),
+        }
     }
 }
 
@@ -1586,6 +1761,91 @@ mod tests {
         assert_eq!(found, expected);
     }
 
+    /// A new, empty folder on `drive` for a test to change files in.
+    #[cfg(windows)]
+    fn scratch_folder(drive: char, name: &str) -> std::path::PathBuf {
+        use std::fs;
+        // The temporary folder is usually on the system drive; if not, a
+        // folder everyone can write to on that drive will do.
+        let temp = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let base = if plain(&temp).starts_with(&format!("{drive}:").to_lowercase()) {
+            temp
+        } else {
+            fs::canonicalize(format!("{drive}:\\Users\\Public")).unwrap()
+        };
+        let folder = base.join(format!("{name}-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    /// Stop watching, change files, start again from the saved index: the
+    /// changes made in between have to be there, without reading the drive.
+    #[test]
+    #[cfg(windows)]
+    fn picks_up_what_changed_while_nothing_was_watching() {
+        use std::fs;
+
+        let drive = system_drive();
+        let folder = scratch_folder(drive, "seekvo-saved-test");
+        let shown = plain(&folder);
+        let saved = folder.with_extension("saved");
+        fs::write(folder.join("stays.txt"), b"1").unwrap();
+        fs::write(folder.join("goes.txt"), b"22").unwrap();
+
+        let (mut live, start) = match LiveDrive::open_saved(drive, &saved) {
+            Ok(opened) => opened,
+            Err(VolumeError::NeedsAdmin) => {
+                eprintln!("skipped: needs an administrator");
+                let _ = fs::remove_dir_all(&folder);
+                return;
+            }
+            Err(other) => panic!("{other}"),
+        };
+        assert_eq!(
+            start,
+            Start::ReadInFull("nothing has been saved yet".to_owned())
+        );
+        expect_inside(&mut live, &shown, &[("goes.txt", 2), ("stays.txt", 1)]);
+        live.save(&saved).unwrap();
+        drop(live);
+
+        // Nothing is watching now.
+        fs::remove_file(folder.join("goes.txt")).unwrap();
+        fs::rename(folder.join("stays.txt"), folder.join("kept.txt")).unwrap();
+        fs::write(folder.join("arrived.bin"), vec![1u8; 5_000]).unwrap();
+
+        let (mut live, start) = LiveDrive::open_saved(drive, &saved).unwrap();
+        assert_eq!(start, Start::FromSaved);
+        // Up to date as soon as it opens, before any poll.
+        assert_eq!(
+            inside(&mut live, &shown),
+            [
+                ("arrived.bin".to_owned(), 5_000),
+                ("kept.txt".to_owned(), 1)
+            ]
+        );
+        // And it keeps following from there.
+        fs::remove_file(folder.join("arrived.bin")).unwrap();
+        expect_inside(&mut live, &shown, &[("kept.txt", 1)]);
+        drop(live);
+
+        // A saved file that has been damaged is not trusted: the drive is
+        // read again instead.
+        let mut bytes = fs::read(&saved).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xFF;
+        fs::write(&saved, bytes).unwrap();
+        let (mut live, start) = LiveDrive::open_saved(drive, &saved).unwrap();
+        assert_eq!(
+            start,
+            Start::ReadInFull("the saved index is damaged".to_owned())
+        );
+        expect_inside(&mut live, &shown, &[("kept.txt", 1)]);
+
+        fs::remove_file(&saved).unwrap();
+        fs::remove_dir_all(&folder).unwrap();
+    }
+
     /// The real thing: change files on the machine's own system drive and
     /// check the index follows. Needs an administrator, like the test above.
     #[test]
@@ -1595,16 +1855,7 @@ mod tests {
         use std::io::Write;
 
         let drive = system_drive();
-        // The temporary folder is usually on the system drive; if not, a
-        // folder everyone can write to on that drive will do.
-        let temp = fs::canonicalize(std::env::temp_dir()).unwrap();
-        let base = if plain(&temp).starts_with(&format!("{drive}:").to_lowercase()) {
-            temp
-        } else {
-            fs::canonicalize(format!("{drive}:\\Users\\Public")).unwrap()
-        };
-        let folder = base.join(format!("seekvo-live-test-{}", std::process::id()));
-        fs::create_dir_all(&folder).unwrap();
+        let folder = scratch_folder(drive, "seekvo-live-test");
         let shown = plain(&folder);
 
         // Written a moment before the drive is read, so the table on disk
@@ -1709,9 +1960,19 @@ mod tests {
             Err(VolumeError::BadDrive('1'))
         ));
         #[cfg(not(windows))]
+        {
+            assert!(matches!(
+                LiveDrive::open('C'),
+                Err(VolumeError::Unsupported)
+            ));
+            assert!(matches!(
+                LiveDrive::open_saved('C', Path::new("saved")),
+                Err(VolumeError::Unsupported)
+            ));
+        }
         assert!(matches!(
-            LiveDrive::open('C'),
-            Err(VolumeError::Unsupported)
+            LiveDrive::open_saved('?', Path::new("saved")),
+            Err(VolumeError::BadDrive('?'))
         ));
     }
 }

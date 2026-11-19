@@ -98,4 +98,26 @@ jobs:
           grep -q 'seekvo-watch-demo\\renamed.txt' "$out"
           tail -n 3 "$out" | grep -q "^0 matches"
           exit "$status"
+      # Save the index, make a file while nothing is watching, then start
+      # twice from the saved index. Each start must load instead of reading
+      # the drive, and must already know the new file.
+      - if: runner.os == 'Windows'
+        name: Start again from a saved index
+        shell: bash
+        run: |
+          saved="$RUNNER_TEMP/c-drive.seekvo"
+          first=$(./target/release/seekvo-engine watch C --saved "$saved" --seconds 1)
+          echo "$first"
+          echo "::notice title=Saving the index::$(grep -m 1 "^Saved the index" <<< "$first")"
+          demo="$(cygpath -u "$USERPROFILE")/seekvo-saved-demo"
+          mkdir -p "$demo"
+          echo hello > "$demo/made-while-away.txt"
+          for title in "Start from the saved index" "Start from the saved index again"; do
+            out=$(./target/release/seekvo-engine watch C made-while-away --saved "$saved" --seconds 1)
+            echo "$out"
+            echo "::notice title=$title::$(head -n 1 <<< "$out")"
+            head -n 1 <<< "$out" | grep -q "^Loaded"
+            grep -q 'seekvo-saved-demo\\made-while-away.txt' <<< "$out"
+          done
+          rm -r "$demo"
       - run: cargo test

@@ -19,9 +19,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::index::{BuildError, Index};
+use crate::index::{BuildError, Index, IndexBuilder};
 use crate::mft::{FileRecord, parse_file_record};
 use crate::ntfs::{JournalEntry, VolumeRecords, VolumeStats, build_index};
 
@@ -221,8 +221,9 @@ pub struct Live<V> {
     /// Tidy the records up once this many rows have been replaced.
     tidy_after: usize,
     /// How many records were looked at again while catching up at the
-    /// start.
+    /// start, and how long that took.
     caught_up: usize,
+    caught_up_in: Duration,
 }
 
 impl<V: RecordSource + Journal> Live<V> {
@@ -237,24 +238,54 @@ impl<V: RecordSource + Journal> Live<V> {
     /// at again. Pass a time shortly before the full read began.
     pub fn start(
         volume: V,
-        mut records: VolumeRecords,
+        records: VolumeRecords,
         root_name: &str,
         replay_since: i64,
     ) -> Result<Self, LiveError> {
+        Self::begin(volume, records, root_name, 0, Some(replay_since))
+    }
+
+    /// Carry on following a drive from records saved earlier.
+    ///
+    /// `cursor` is the journal position that was current when the records
+    /// were saved, as [`cursor`](Self::cursor) gave it. Everything the
+    /// journal has noted since is taken in before this returns. Fails with
+    /// [`JournalError::Expired`] when the journal no longer goes back that
+    /// far; the drive then has to be read in full again.
+    pub fn resume(
+        volume: V,
+        records: VolumeRecords,
+        root_name: &str,
+        cursor: i64,
+    ) -> Result<Self, LiveError> {
+        Self::begin(volume, records, root_name, cursor, None)
+    }
+
+    fn begin(
+        volume: V,
+        mut records: VolumeRecords,
+        root_name: &str,
+        cursor: i64,
+        only_since: Option<i64>,
+    ) -> Result<Self, LiveError> {
         records.seal();
-        let (index, stats) = build_index(root_name, &records)?;
         let mut live = Live {
             volume,
             records,
             root_name: root_name.to_owned(),
-            cursor: 0,
-            index,
-            stats,
-            dirty: false,
+            cursor,
+            // Built below, once, after catching up.
+            index: IndexBuilder::new().finish(),
+            stats: VolumeStats::default(),
+            dirty: true,
             tidy_after: 50_000,
             caught_up: 0,
+            caught_up_in: Duration::ZERO,
         };
-        live.caught_up = live.apply_journal(Some(replay_since))?;
+        let started = Instant::now();
+        live.caught_up = live.apply_journal(only_since)?;
+        live.caught_up_in = started.elapsed();
+        live.index()?;
         Ok(live)
     }
 
@@ -328,9 +359,30 @@ impl<V: RecordSource + Journal> Live<V> {
     }
 
     /// How many records were looked at again at the start, to catch up
-    /// with changes made around the time of the full read.
+    /// with changes the records it was given did not have yet.
     pub fn caught_up(&self) -> usize {
         self.caught_up
+    }
+
+    /// How long catching up at the start took.
+    pub fn caught_up_in(&self) -> Duration {
+        self.caught_up_in
+    }
+
+    /// Where in the journal the next poll continues from. Save it together
+    /// with the records to [`resume`](Self::resume) later.
+    pub fn cursor(&self) -> i64 {
+        self.cursor
+    }
+
+    /// The records as they are now.
+    pub fn records(&self) -> &VolumeRecords {
+        &self.records
+    }
+
+    /// The drive being followed.
+    pub fn volume(&self) -> &V {
+        &self.volume
     }
 
     #[cfg(test)]
@@ -686,11 +738,58 @@ mod tests {
             live.volume
                 .write(number, file(ROOT, &format!("f{number}.txt"), 1), NOW);
         }
+        assert_eq!(live.stats().files, 2);
         assert!(live.poll().unwrap() >= 5);
         assert_eq!(live.poll().unwrap(), 0);
+        // Counts are from the last build, which has not happened yet.
         assert_eq!(live.stats().files, 2);
         listing(&mut live);
         assert_eq!(live.stats().files, 7);
+    }
+
+    #[test]
+    fn carries_on_from_saved_records() {
+        let (mut drive, records) = drive();
+        let mut live = follow(&mut drive, records);
+        live.volume
+            .write(40, file(ROOT, "before-saving.txt", 1), NOW);
+        live.poll().unwrap();
+        let cursor = live.cursor();
+
+        // Save, as a file would be written, and stop watching.
+        let origin = crate::snapshot::Origin {
+            volume_serial: 1,
+            journal_id: 2,
+            cursor,
+        };
+        let mut on_disk = Vec::new();
+        crate::snapshot::write(&mut on_disk, live.records(), origin).unwrap();
+        drop(live);
+        let saved = crate::snapshot::read(&mut on_disk.as_slice()).unwrap();
+        assert_eq!(saved.origin, origin);
+        let saved = saved.records;
+
+        // While nothing was watching: one file renamed, one deleted, one
+        // new. All of it long ago by the clock, which must not matter.
+        drive.write(31, file(DOCS, "b.txt", 5), LONG_AGO);
+        drive.delete(32, LONG_AGO);
+        drive.write(41, file(ROOT, "while-away.txt", 2), LONG_AGO);
+
+        let lookups_before = drive.lookups;
+        let mut live = Live::resume(&mut drive, saved, "/", cursor).unwrap();
+        assert_eq!(live.caught_up(), 4); // three files and the top folder
+        assert_eq!(
+            listing(&mut live),
+            [
+                entry("/Docs", 0),
+                entry("/Docs/b.txt", 5),
+                entry("/before-saving.txt", 1),
+                entry("/while-away.txt", 2)
+            ]
+        );
+        // Only what changed was looked at; before-saving.txt was not.
+        assert_eq!(live.volume.lookups - lookups_before, 4);
+        assert_eq!(live.poll().unwrap(), 0);
     }
 
     #[test]

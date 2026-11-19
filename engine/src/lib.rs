@@ -15,6 +15,7 @@ pub mod mft;
 pub mod ntfs;
 pub mod query;
 pub mod scan;
+pub mod snapshot;
 pub mod synthetic;
 
 pub use index::{BuildError, EntryId, Index, IndexBuilder, Kind, SearchResult};
