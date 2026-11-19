@@ -153,25 +153,25 @@ Things to know:
 Measured in CI on GitHub's hosted Windows runner (release build), on its C: drive: NTFS, about
 1.2 million file names and 208,500 folders. Each run is on a separate machine.
 
-Reading the whole drive (`drive C`), five runs:
+Reading the whole drive (`drive C`), six runs:
 
 | | First read | Read again |
 | --- | ---: | ---: |
 | Reading the file table off the drive | 8.3 to 13.3 s | 3.2 to 5.8 s |
 | Arranging the records into the index | 0.7 to 0.8 s | 0.7 to 0.8 s |
-| **Total** | **9.0, 9.5, 9.8, 11.9 and 14.2 s** | **4.0, 4.0, 4.1, 4.5 and 6.5 s** |
+| **Total** | **9.0, 9.5, 9.8, 11.9, 12.4 and 14.2 s** | **4.0, 4.0, 4.1, 4.5, 5.0 and 6.5 s** |
 
 The index holds 102 MB of memory, and a search for `system32` (629 to 723 matches) took 4 to
 5 ms.
 
-Following changes and starting from a saved index (`watch C --saved`), two runs:
+Following changes and starting from a saved index (`watch C --saved`), two or three runs each:
 
 | | |
 | --- | ---: |
 | Taking in a handful of changed files | 0.1 to 0.2 ms |
 | Rebuilding the index so they can be searched | 0.71 to 0.83 s |
-| Saving the index (68.7 MB file) | 0.31 s |
-| Starting from the saved index, catching up included | 0.84 and 0.85 s |
+| Saving the index (68.7 MB file) | 0.30 to 0.31 s |
+| Starting from the saved index, catching up included | 0.84 to 0.90 s over four starts |
 
 The start from the saved index was timed right after the file was written, so Windows still had
 it in memory, and only a few files had changed in between. A start after a restart, or after a
