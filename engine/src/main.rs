@@ -17,6 +17,14 @@ Usage:
       file sizes. --reader records asks Windows for a summary of each
       record instead: no sizes, but quick when Windows has the drive's
       table in memory already.
+  seekvo-engine watch <letter> [words...] [--path] [--limit N]
+                      [--seconds S] [--saved FILE]
+      Index a whole NTFS drive, then keep the index current as files
+      are created, renamed, moved, resized and deleted, and repeat the
+      search after each change. Stops after S seconds, or with Ctrl+C.
+      With --saved, the index is kept in FILE: the next start loads it
+      and catches up from the drive's change journal instead of reading
+      the drive again. Windows only, from an administrator terminal.
   seekvo-engine image <file> [words...] [--path] [--limit N]
       Index an NTFS volume saved as an image file, then search it.
       Works anywhere.
@@ -26,7 +34,7 @@ Usage:
       Build a made-up drive (one million files unless told otherwise)
       and time a set of searches on it.
 
-With no words, drive, image and scan only print the index numbers.
+With no words, drive, watch, image and scan only print the index numbers.
 
 Search words:
   All words must match, in any order and any letter case.
@@ -45,6 +53,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let outcome = match args.first().map(String::as_str) {
         Some("drive") => run_drive(&args[1..]),
+        Some("watch") => run_watch(&args[1..]),
         Some("image") => run_image(&args[1..]),
         Some("scan") => run_scan(&args[1..]),
         Some("bench") => run_bench(&args[1..]),
@@ -81,6 +90,10 @@ struct Target<'a> {
     query: Query,
     limit: usize,
     reader: Reader,
+    /// For `watch`: how long to keep going. Forever when not given.
+    seconds: Option<u64>,
+    /// For `watch`: the file to keep the index in between runs.
+    saved: Option<&'a str>,
 }
 
 fn parse_target<'a>(args: &'a [String], what: &str) -> Result<Target<'a>, Stop> {
@@ -89,12 +102,22 @@ fn parse_target<'a>(args: &'a [String], what: &str) -> Result<Target<'a>, Stop> 
     let mut scope = Scope::Smart;
     let mut limit = 20usize;
     let mut reader = Reader::Table;
+    let mut seconds = None;
+    let mut saved = None;
 
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--path" => scope = Scope::Path,
             "--limit" => limit = number_after(&mut rest, "--limit")?,
+            "--seconds" => seconds = Some(number_after(&mut rest, "--seconds")? as u64),
+            "--saved" => {
+                saved = Some(
+                    rest.next()
+                        .map(String::as_str)
+                        .ok_or_else(|| Stop::Usage("--saved needs a file name".to_owned()))?,
+                )
+            }
             "--reader" => {
                 reader = match rest.next().map(String::as_str) {
                     Some("table") => Reader::Table,
@@ -111,23 +134,24 @@ fn parse_target<'a>(args: &'a [String], what: &str) -> Result<Target<'a>, Stop> 
         query: Query::parse(&words.join(" ")).with_scope(scope),
         limit,
         reader,
+        seconds,
+        saved,
     })
+}
+
+/// Accept "C", "c:" and "C:\".
+fn drive_letter(place: &str) -> Result<char, Stop> {
+    match place.trim_end_matches(['\\', '/']).trim_end_matches(':') {
+        one if one.chars().count() == 1 => one.chars().next(),
+        _ => None,
+    }
+    .map(|letter| letter.to_ascii_uppercase())
+    .ok_or_else(|| Stop::Usage(format!("{place} is not a drive letter")))
 }
 
 fn run_drive(args: &[String]) -> Result<(), Stop> {
     let target = parse_target(args, "a drive letter")?;
-    // Accept "C", "c:" and "C:\".
-    let letter = match target
-        .place
-        .trim_end_matches(['\\', '/'])
-        .trim_end_matches(':')
-    {
-        one if one.chars().count() == 1 => one.chars().next(),
-        _ => None,
-    }
-    .ok_or_else(|| Stop::Usage(format!("{} is not a drive letter", target.place)))?;
-
-    let letter = letter.to_ascii_uppercase();
+    let letter = drive_letter(target.place)?;
     let started = Instant::now();
     let (records, damaged) = match target.reader {
         Reader::Table => {
@@ -172,6 +196,95 @@ fn run_drive(args: &[String]) -> Result<(), Stop> {
     }
     search_and_print(&index, &target);
     Ok(())
+}
+
+fn run_watch(args: &[String]) -> Result<(), Stop> {
+    let target = parse_target(args, "a drive letter")?;
+    let letter = drive_letter(target.place)?;
+    let failed = |error: &dyn std::fmt::Display| Stop::Failed(error.to_string());
+
+    let started = Instant::now();
+    let (mut live, start) = match target.saved {
+        Some(file) => ntfs::LiveDrive::open_saved(letter, Path::new(file)),
+        None => {
+            ntfs::LiveDrive::open(letter).map(|live| (live, ntfs::Start::ReadInFull(String::new())))
+        }
+    }
+    .map_err(|e| failed(&e))?;
+    let took = started.elapsed();
+    let stats = live.stats();
+    match &start {
+        ntfs::Start::FromSaved => println!(
+            "Loaded {} files and {} folders on {}: from the saved index in {} ({} of that catching up on {} that changed since the save).",
+            group(stats.files),
+            group(stats.dirs),
+            letter,
+            millis(took),
+            millis(live.caught_up_in()),
+            group(live.caught_up()),
+        ),
+        ntfs::Start::ReadInFull(why) => {
+            if !why.is_empty() {
+                println!("Reading the drive in full: {why}.");
+            }
+            println!(
+                "Indexed {} files and {} folders on {}: in {} ({} of that catching up on {} that changed while reading).",
+                group(stats.files),
+                group(stats.dirs),
+                letter,
+                millis(took),
+                millis(live.caught_up_in()),
+                group(live.caught_up()),
+            );
+        }
+    }
+    let save = |live: &ntfs::LiveDrive| -> Result<(), Stop> {
+        let Some(file) = target.saved else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        live.save(Path::new(file))
+            .map_err(|e| Stop::Failed(format!("cannot save the index to {file}: {e}")))?;
+        let bytes = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+        println!(
+            "Saved the index to {file} in {} ({}).",
+            millis(started.elapsed()),
+            file_size(bytes)
+        );
+        Ok(())
+    };
+    if matches!(start, ntfs::Start::ReadInFull(_)) {
+        save(&live)?;
+    }
+    search_and_print(live.index().map_err(|e| failed(&e))?, &target);
+    println!("Watching {letter}: for changes.");
+
+    let deadline = target
+        .seconds
+        .map(|seconds| Instant::now() + Duration::from_secs(seconds));
+    while deadline.is_none_or(|deadline| Instant::now() < deadline) {
+        std::thread::sleep(Duration::from_secs(1));
+
+        let started = Instant::now();
+        let changed = live.poll().map_err(|e| failed(&e))?;
+        let polled = started.elapsed();
+        if changed == 0 {
+            continue;
+        }
+        live.index().map_err(|e| failed(&e))?;
+        let rebuilt = started.elapsed() - polled;
+        let stats = live.stats();
+        println!(
+            "{} changed: read in {}, index rebuilt in {}. Now {} files and {} folders.",
+            group(changed),
+            millis(polled),
+            millis(rebuilt),
+            group(stats.files),
+            group(stats.dirs),
+        );
+        search_and_print(live.index().map_err(|e| failed(&e))?, &target);
+    }
+    save(&live)
 }
 
 fn run_image(args: &[String]) -> Result<(), Stop> {

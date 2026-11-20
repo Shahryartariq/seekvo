@@ -64,4 +64,60 @@ jobs:
           index_drive records "Records from Windows first read"
           index_drive table "File table read again"
           index_drive records "Records from Windows read again"
+      # Index the drive, keep watching it, and meanwhile create, rename and
+      # delete a file. The watcher repeats its search after every change it
+      # sees, so its output shows the file appear, change name and go.
+      - if: runner.os == 'Windows'
+        name: Follow changes on the runner's system drive
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/watch.txt"
+          ./target/release/seekvo-engine watch C seekvo-watch-demo --path --limit 5 --seconds 20 > "$out" 2>&1 &
+          watcher=$!
+          for _ in $(seq 1 180); do
+            grep -q "^Watching" "$out" && break
+            kill -0 "$watcher" 2>/dev/null || break
+            sleep 1
+          done
+          demo="$(cygpath -u "$USERPROFILE")/seekvo-watch-demo"
+          mkdir -p "$demo"
+          echo hello > "$demo/first.txt"
+          sleep 4
+          mv "$demo/first.txt" "$demo/renamed.txt"
+          sleep 4
+          rm -r "$demo"
+          status=0
+          wait "$watcher" || status=$?
+          cat "$out"
+          echo "::notice title=Following changes start::$(head -n 1 "$out")"
+          grep -m 4 " changed: " "$out" | while read -r line; do
+            echo "::notice title=Following changes::$line"
+          done
+          # The file must have been seen under both names, and seen to go.
+          grep -q 'seekvo-watch-demo\\first.txt' "$out"
+          grep -q 'seekvo-watch-demo\\renamed.txt' "$out"
+          tail -n 3 "$out" | grep -q "^0 matches"
+          exit "$status"
+      # Save the index, make a file while nothing is watching, then start
+      # twice from the saved index. Each start must load instead of reading
+      # the drive, and must already know the new file.
+      - if: runner.os == 'Windows'
+        name: Start again from a saved index
+        shell: bash
+        run: |
+          saved="$RUNNER_TEMP/c-drive.seekvo"
+          first=$(./target/release/seekvo-engine watch C --saved "$saved" --seconds 1)
+          echo "$first"
+          echo "::notice title=Saving the index::$(grep -m 1 "^Saved the index" <<< "$first")"
+          demo="$(cygpath -u "$USERPROFILE")/seekvo-saved-demo"
+          mkdir -p "$demo"
+          echo hello > "$demo/made-while-away.txt"
+          for title in "Start from the saved index" "Start from the saved index again"; do
+            out=$(./target/release/seekvo-engine watch C made-while-away --saved "$saved" --seconds 1)
+            echo "$out"
+            echo "::notice title=$title::$(head -n 1 <<< "$out")"
+            head -n 1 <<< "$out" | grep -q "^Loaded"
+            grep -q 'seekvo-saved-demo\\made-while-away.txt' <<< "$out"
+          done
+          rm -r "$demo"
       - run: cargo test

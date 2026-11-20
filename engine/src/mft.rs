@@ -84,6 +84,7 @@ const RECORD_NUMBER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// NTFS protects each 512 bytes of a record with a check value, whatever
 /// the drive's real sector size is.
 const FIXUP_STRIDE: usize = 512;
+const ATTRIBUTE_LIST: u32 = 0x20;
 const ATTRIBUTE_FILE_NAME: u32 = 0x30;
 const ATTRIBUTE_DATA: u32 = 0x80;
 const ATTRIBUTE_END: u32 = 0xFFFF_FFFF;
@@ -302,6 +303,21 @@ fn parse_data(attribute: &[u8]) -> Option<Data> {
     })
 }
 
+/// The parent folder and the UTF-16 name from a file-name attribute, or
+/// `None` for a malformed one or for a short 8.3 name.
+fn parse_file_name(attribute: &[u8]) -> Option<(u64, &[u8])> {
+    let length = u32_at(attribute, 0x10)? as usize;
+    let at = usize::from(u16_at(attribute, 0x14)?);
+    let value = attribute.get(at..at.checked_add(length)?)?;
+    let parent = u64_at(value, 0)?;
+    let characters = usize::from(*value.get(0x40)?);
+    if *value.get(0x41)? == NAMESPACE_DOS {
+        return None;
+    }
+    let name = value.get(0x42..0x42 + 2 * characters)?;
+    Some((parent, name))
+}
+
 /// Walk the attributes of a checked record, calling `visit` with each
 /// attribute's type and bytes.
 fn for_each_attribute(record: &[u8], mut visit: impl FnMut(u32, &[u8])) {
@@ -439,25 +455,7 @@ impl Scan {
     }
 
     fn file_name(&mut self, attribute: &[u8], owner: u64) {
-        let (Some(length), Some(at)) = (u32_at(attribute, 0x10), u16_at(attribute, 0x14)) else {
-            return;
-        };
-        let at = usize::from(at);
-        let Some(value) = at
-            .checked_add(length as usize)
-            .and_then(|end| attribute.get(at..end))
-        else {
-            return;
-        };
-        let (Some(parent), Some(&characters), Some(&namespace)) =
-            (u64_at(value, 0), value.get(0x40), value.get(0x41))
-        else {
-            return;
-        };
-        if namespace == NAMESPACE_DOS {
-            return;
-        }
-        let Some(name) = value.get(0x42..0x42 + 2 * usize::from(characters)) else {
+        let Some((parent, name)) = parse_file_name(attribute) else {
             return;
         };
         let units = name
@@ -486,12 +484,144 @@ impl Scan {
     }
 }
 
+/// What one file record says, read on its own.
+///
+/// The table reader above looks at every record and pieces files together
+/// afterwards. This is for the other case: one record just changed and only
+/// that file needs looking at again.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileRecord {
+    pub in_use: bool,
+    pub is_dir: bool,
+    /// For an overflow record: the number of the record it belongs to.
+    pub belongs_to: Option<u64>,
+    /// Each name with the record number of the folder it is in. Short 8.3
+    /// names are left out.
+    pub names: Vec<(u64, String)>,
+    /// Size of the file's data in bytes, when this record holds the start
+    /// of it.
+    pub size: Option<u64>,
+    /// Other records that hold names, or the start of the data, for this
+    /// file.
+    pub continued_in: Vec<u64>,
+    /// The file has overflow records, but the list of them is stored
+    /// outside this record and was not read.
+    pub list_elsewhere: bool,
+}
+
+/// Read one file record.
+///
+/// Records straight off a drive carry NTFS's per-sector protection; records
+/// handed over by Windows have it removed already. Both are accepted.
+/// Returns `None` if the bytes are not a file record at all.
+pub fn parse_file_record(bytes: &[u8]) -> Option<FileRecord> {
+    if bytes.get(..4) != Some(b"FILE") {
+        return None;
+    }
+    let mut record = bytes.to_vec();
+    if !apply_fixups(&mut record) {
+        // Either the protection was removed already, or the attempt left
+        // the copy half changed. Start again from what was given.
+        record.copy_from_slice(bytes);
+    }
+    let record = record.as_slice();
+
+    let flags = u16_at(record, 0x16)?;
+    let base = u64_at(record, 0x20)?;
+    let mut found = FileRecord {
+        in_use: flags & RECORD_IN_USE != 0,
+        is_dir: flags & RECORD_IS_DIRECTORY != 0,
+        belongs_to: (base != 0).then_some(base & RECORD_NUMBER_MASK),
+        ..FileRecord::default()
+    };
+
+    for_each_attribute(record, |kind, attribute| {
+        let is_resident = attribute.get(8) == Some(&0);
+        let name_length = attribute.get(9).copied().unwrap_or(0);
+        match kind {
+            ATTRIBUTE_LIST if is_resident => list_entries(attribute, &mut found.continued_in),
+            ATTRIBUTE_LIST => found.list_elsewhere = true,
+            ATTRIBUTE_FILE_NAME if is_resident => {
+                if let Some((parent, name)) = parse_file_name(attribute) {
+                    let units = name
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
+                    let name: String = char::decode_utf16(units)
+                        .map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER))
+                        .collect();
+                    found.names.push((parent & RECORD_NUMBER_MASK, name));
+                }
+            }
+            ATTRIBUTE_DATA if name_length == 0 && found.size.is_none() => {
+                match parse_data(attribute) {
+                    Some(Data::Inside { size }) => found.size = Some(size),
+                    Some(Data::Outside {
+                        first_cluster_index: 0,
+                        size,
+                        ..
+                    }) => found.size = Some(size),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    });
+    found.continued_in.sort_unstable();
+    found.continued_in.dedup();
+    Some(found)
+}
+
+/// From an attribute list held inside a record, collect the numbers of the
+/// records that hold file names or the start of the unnamed data.
+fn list_entries(attribute: &[u8], records: &mut Vec<u64>) {
+    let (Some(length), Some(at)) = (u32_at(attribute, 0x10), u16_at(attribute, 0x14)) else {
+        return;
+    };
+    let at = usize::from(at);
+    let Some(list) = at
+        .checked_add(length as usize)
+        .and_then(|end| attribute.get(at..end))
+    else {
+        return;
+    };
+
+    let mut at = 0usize;
+    while let (Some(kind), Some(entry_length)) = (u32_at(list, at), u16_at(list, at + 4)) {
+        let entry_length = usize::from(entry_length);
+        if entry_length < 0x1A || at + entry_length > list.len() {
+            break;
+        }
+        let entry = &list[at..at + entry_length];
+        at += entry_length;
+
+        let name_length = entry[6];
+        let (Some(first_cluster_index), Some(holder)) = (u64_at(entry, 8), u64_at(entry, 0x10))
+        else {
+            continue;
+        };
+        let wanted = kind == ATTRIBUTE_FILE_NAME
+            || (kind == ATTRIBUTE_DATA && name_length == 0 && first_cluster_index == 0);
+        if wanted {
+            records.push(holder & RECORD_NUMBER_MASK);
+        }
+    }
+}
+
 fn round_up(value: usize, multiple: usize) -> usize {
     value.div_ceil(multiple) * multiple
 }
 
 /// Read the whole file table of an NTFS volume.
 pub fn read_file_table(source: &mut dyn BlockSource) -> Result<FileTable, MftError> {
+    read_table(source, |_, _| {})
+}
+
+/// [`read_file_table`], showing each record to `tap` with its number, as
+/// it came off the drive, before anything is done with it.
+fn read_table(
+    source: &mut dyn BlockSource,
+    mut tap: impl FnMut(u64, &[u8]),
+) -> Result<FileTable, MftError> {
     // 4096 bytes is a whole number of sectors for every sector size NTFS
     // supports, and no NTFS volume is smaller.
     let mut boot = vec![0u8; 4096];
@@ -582,7 +712,9 @@ pub fn read_file_table(source: &mut dyn BlockSource) -> Result<FileTable, MftErr
                         break;
                     }
                     let record = &mut buffer[i * record_size..(i + 1) * record_size];
-                    scan.record(record, start / record_size as u64);
+                    let number = start / record_size as u64;
+                    tap(number, record);
+                    scan.record(record, number);
                 }
                 let consumed = whole * record_size;
                 buffer.copy_within(consumed..filled, 0);
@@ -605,8 +737,137 @@ pub fn read_file_table(source: &mut dyn BlockSource) -> Result<FileTable, MftErr
     Ok(scan.finish())
 }
 
+/// Builders for file records, shared by the tests of this module and of
+/// [`crate::live`].
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    pub(crate) const SECTOR: usize = 512;
+    pub(crate) const RECORD: usize = 1024;
+    pub(crate) const ROOT: u64 = 5;
+
+    pub(crate) fn padded(mut bytes: Vec<u8>) -> Vec<u8> {
+        bytes.resize(bytes.len().next_multiple_of(8), 0);
+        let length = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&length.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn name_attribute(parent: u64, name: &str, namespace: u8) -> Vec<u8> {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let mut value = vec![0u8; 0x42];
+        value[0..8].copy_from_slice(&((1u64 << 48) | parent).to_le_bytes());
+        value[0x40] = units.len() as u8;
+        value[0x41] = namespace;
+        for unit in units {
+            value.extend_from_slice(&unit.to_le_bytes());
+        }
+        let mut attribute = vec![0u8; 24];
+        attribute[0..4].copy_from_slice(&ATTRIBUTE_FILE_NAME.to_le_bytes());
+        attribute[0x10..0x14].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        attribute[0x14..0x16].copy_from_slice(&24u16.to_le_bytes());
+        attribute.extend(value);
+        padded(attribute)
+    }
+
+    /// A list of where a file's attributes are, held inside the record.
+    /// Each entry: attribute type, name length, first cluster index, and
+    /// the record that holds it.
+    pub(crate) fn attribute_list(entries: &[(u32, u8, u64, u64)]) -> Vec<u8> {
+        let mut value = Vec::new();
+        for &(kind, name_length, first_cluster_index, holder) in entries {
+            let mut entry = vec![0u8; 0x20];
+            entry[0..4].copy_from_slice(&kind.to_le_bytes());
+            entry[4..6].copy_from_slice(&0x20u16.to_le_bytes());
+            entry[6] = name_length;
+            entry[8..16].copy_from_slice(&first_cluster_index.to_le_bytes());
+            entry[0x10..0x18].copy_from_slice(&((1u64 << 48) | holder).to_le_bytes());
+            value.extend(entry);
+        }
+        let mut attribute = vec![0u8; 24];
+        attribute[0..4].copy_from_slice(&ATTRIBUTE_LIST.to_le_bytes());
+        attribute[0x10..0x14].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        attribute[0x14..0x16].copy_from_slice(&24u16.to_le_bytes());
+        attribute.extend(value);
+        padded(attribute)
+    }
+
+    /// The same kind of list, but stored outside the record.
+    pub(crate) fn attribute_list_elsewhere() -> Vec<u8> {
+        let mut attribute = vec![0u8; 0x48];
+        attribute[0..4].copy_from_slice(&ATTRIBUTE_LIST.to_le_bytes());
+        attribute[8] = 1;
+        attribute[0x20..0x22].copy_from_slice(&0x40u16.to_le_bytes());
+        padded(attribute)
+    }
+
+    pub(crate) fn data_inside(size: u32) -> Vec<u8> {
+        let mut attribute = vec![0u8; 24];
+        attribute[0..4].copy_from_slice(&ATTRIBUTE_DATA.to_le_bytes());
+        attribute[0x10..0x14].copy_from_slice(&size.to_le_bytes());
+        attribute[0x14..0x16].copy_from_slice(&24u16.to_le_bytes());
+        attribute.resize(24 + size as usize, 0xAA);
+        padded(attribute)
+    }
+
+    pub(crate) fn data_outside(first_cluster_index: u64, size: u64, runs: &[u8]) -> Vec<u8> {
+        let mut attribute = vec![0u8; 0x40];
+        attribute[0..4].copy_from_slice(&ATTRIBUTE_DATA.to_le_bytes());
+        attribute[8] = 1;
+        attribute[0x10..0x18].copy_from_slice(&first_cluster_index.to_le_bytes());
+        attribute[0x20..0x22].copy_from_slice(&0x40u16.to_le_bytes());
+        attribute[0x30..0x38].copy_from_slice(&size.to_le_bytes());
+        attribute.extend_from_slice(runs);
+        attribute.push(0);
+        padded(attribute)
+    }
+
+    /// One run: `clusters` long, starting `delta` clusters after the
+    /// previous run in the same list.
+    pub(crate) fn run(clusters: u8, delta: i16) -> Vec<u8> {
+        let mut bytes = vec![0x21, clusters];
+        bytes.extend_from_slice(&delta.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) const IN_USE: u16 = RECORD_IN_USE;
+    pub(crate) const FOLDER: u16 = RECORD_IN_USE | RECORD_IS_DIRECTORY;
+
+    /// A record with its per-sector protection applied, as it sits on disk.
+    pub(crate) fn record(flags: u16, main_record: Option<u64>, attributes: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = vec![0u8; RECORD];
+        bytes[0..4].copy_from_slice(b"FILE");
+        bytes[4..6].copy_from_slice(&0x30u16.to_le_bytes());
+        bytes[6..8].copy_from_slice(&3u16.to_le_bytes());
+        bytes[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
+        bytes[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
+        if let Some(main) = main_record {
+            bytes[0x20..0x28].copy_from_slice(&((1u64 << 48) | main).to_le_bytes());
+        }
+        let mut at = 0x38;
+        for attribute in attributes {
+            bytes[at..at + attribute.len()].copy_from_slice(attribute);
+            at += attribute.len();
+        }
+        bytes[at..at + 4].copy_from_slice(&ATTRIBUTE_END.to_le_bytes());
+        bytes[0x18..0x1C].copy_from_slice(&((at + 8) as u32).to_le_bytes());
+
+        let counter = [0x07, 0x00];
+        bytes[0x30..0x32].copy_from_slice(&counter);
+        for sector in 1..=2 {
+            let end = sector * SECTOR;
+            let saved = [bytes[end - 2], bytes[end - 1]];
+            bytes[0x30 + 2 * sector..0x32 + 2 * sector].copy_from_slice(&saved);
+            bytes[end - 2..end].copy_from_slice(&counter);
+        }
+        bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::*;
     use super::*;
     use crate::index::{EntryId, Index, Kind};
     use crate::ntfs::{VolumeStats, build_index};
@@ -765,11 +1026,8 @@ mod tests {
 
     // ---- A hand-made volume, for the cases a healthy one does not have --
 
-    const SECTOR: usize = 512;
     const CLUSTER: usize = 4096;
-    const RECORD: usize = 1024;
     const TABLE_CLUSTER: usize = 4;
-    const ROOT: u64 = 5;
 
     fn boot_sector() -> Vec<u8> {
         let mut sector = vec![0u8; SECTOR];
@@ -780,92 +1038,6 @@ mod tests {
         sector[0x30..0x38].copy_from_slice(&(TABLE_CLUSTER as u64).to_le_bytes());
         sector[0x40] = 0xF6; // -10: records of 2^10 bytes
         sector
-    }
-
-    fn padded(mut bytes: Vec<u8>) -> Vec<u8> {
-        bytes.resize(bytes.len().next_multiple_of(8), 0);
-        let length = bytes.len() as u32;
-        bytes[4..8].copy_from_slice(&length.to_le_bytes());
-        bytes
-    }
-
-    fn name_attribute(parent: u64, name: &str, namespace: u8) -> Vec<u8> {
-        let units: Vec<u16> = name.encode_utf16().collect();
-        let mut value = vec![0u8; 0x42];
-        value[0..8].copy_from_slice(&((1u64 << 48) | parent).to_le_bytes());
-        value[0x40] = units.len() as u8;
-        value[0x41] = namespace;
-        for unit in units {
-            value.extend_from_slice(&unit.to_le_bytes());
-        }
-        let mut attribute = vec![0u8; 24];
-        attribute[0..4].copy_from_slice(&ATTRIBUTE_FILE_NAME.to_le_bytes());
-        attribute[0x10..0x14].copy_from_slice(&(value.len() as u32).to_le_bytes());
-        attribute[0x14..0x16].copy_from_slice(&24u16.to_le_bytes());
-        attribute.extend(value);
-        padded(attribute)
-    }
-
-    fn data_inside(size: u32) -> Vec<u8> {
-        let mut attribute = vec![0u8; 24];
-        attribute[0..4].copy_from_slice(&ATTRIBUTE_DATA.to_le_bytes());
-        attribute[0x10..0x14].copy_from_slice(&size.to_le_bytes());
-        attribute[0x14..0x16].copy_from_slice(&24u16.to_le_bytes());
-        attribute.resize(24 + size as usize, 0xAA);
-        padded(attribute)
-    }
-
-    fn data_outside(first_cluster_index: u64, size: u64, runs: &[u8]) -> Vec<u8> {
-        let mut attribute = vec![0u8; 0x40];
-        attribute[0..4].copy_from_slice(&ATTRIBUTE_DATA.to_le_bytes());
-        attribute[8] = 1;
-        attribute[0x10..0x18].copy_from_slice(&first_cluster_index.to_le_bytes());
-        attribute[0x20..0x22].copy_from_slice(&0x40u16.to_le_bytes());
-        attribute[0x30..0x38].copy_from_slice(&size.to_le_bytes());
-        attribute.extend_from_slice(runs);
-        attribute.push(0);
-        padded(attribute)
-    }
-
-    /// One run: `clusters` long, starting `delta` clusters after the
-    /// previous run in the same list.
-    fn run(clusters: u8, delta: i16) -> Vec<u8> {
-        let mut bytes = vec![0x21, clusters];
-        bytes.extend_from_slice(&delta.to_le_bytes());
-        bytes
-    }
-
-    const IN_USE: u16 = RECORD_IN_USE;
-    const FOLDER: u16 = RECORD_IN_USE | RECORD_IS_DIRECTORY;
-
-    /// A record with its per-sector protection applied, as it sits on disk.
-    fn record(flags: u16, main_record: Option<u64>, attributes: &[Vec<u8>]) -> Vec<u8> {
-        let mut bytes = vec![0u8; RECORD];
-        bytes[0..4].copy_from_slice(b"FILE");
-        bytes[4..6].copy_from_slice(&0x30u16.to_le_bytes());
-        bytes[6..8].copy_from_slice(&3u16.to_le_bytes());
-        bytes[0x14..0x16].copy_from_slice(&0x38u16.to_le_bytes());
-        bytes[0x16..0x18].copy_from_slice(&flags.to_le_bytes());
-        if let Some(main) = main_record {
-            bytes[0x20..0x28].copy_from_slice(&((1u64 << 48) | main).to_le_bytes());
-        }
-        let mut at = 0x38;
-        for attribute in attributes {
-            bytes[at..at + attribute.len()].copy_from_slice(attribute);
-            at += attribute.len();
-        }
-        bytes[at..at + 4].copy_from_slice(&ATTRIBUTE_END.to_le_bytes());
-        bytes[0x18..0x1C].copy_from_slice(&((at + 8) as u32).to_le_bytes());
-
-        let counter = [0x07, 0x00];
-        bytes[0x30..0x32].copy_from_slice(&counter);
-        for sector in 1..=2 {
-            let end = sector * SECTOR;
-            let saved = [bytes[end - 2], bytes[end - 1]];
-            bytes[0x30 + 2 * sector..0x32 + 2 * sector].copy_from_slice(&saved);
-            bytes[end - 2..end].copy_from_slice(&counter);
-        }
-        bytes
     }
 
     /// A whole volume held in memory.
@@ -930,7 +1102,14 @@ mod tests {
         // A file whose data attribute did not fit and lives in record 19.
         put(
             18,
-            record(IN_USE, None, &[name_attribute(ROOT, "split.bin", 1)]),
+            record(
+                IN_USE,
+                None,
+                &[
+                    attribute_list(&[(0x30, 0, 0, 18), (0x80, 0, 0, 19)]),
+                    name_attribute(ROOT, "split.bin", 1),
+                ],
+            ),
         );
         put(
             19,
@@ -1208,5 +1387,173 @@ mod tests {
         let mut none = on_disk;
         none[6..8].copy_from_slice(&1u16.to_le_bytes());
         assert!(!apply_fixups(&mut none));
+    }
+
+    // ---- One record on its own -------------------------------------------
+
+    /// Every record of a volume by number, as it is on the drive.
+    struct Records(std::collections::HashMap<u64, Vec<u8>>);
+
+    impl Records {
+        fn of(source: &mut dyn BlockSource) -> Self {
+            let mut records = std::collections::HashMap::new();
+            read_table(source, |number, bytes| {
+                records.insert(number, bytes.to_vec());
+            })
+            .unwrap();
+            Records(records)
+        }
+    }
+
+    impl crate::live::RecordSource for Records {
+        fn file_record(&mut self, number: u64) -> io::Result<Option<Vec<u8>>> {
+            Ok(self.0.get(&number).cloned())
+        }
+    }
+
+    /// Build the index the slow way: start with nothing and look at every
+    /// record one by one, as happens when the change journal names it.
+    fn one_by_one(source: &mut dyn BlockSource) -> Vec<(String, u64)> {
+        let mut drive = Records::of(source);
+        let mut numbers: Vec<u64> = drive.0.keys().copied().collect();
+        // Highest first, so files arrive before the folders they are in.
+        numbers.sort_unstable_by(|a, b| b.cmp(a));
+
+        let mut records = VolumeRecords::new();
+        records.seal();
+        for number in numbers {
+            crate::live::refresh(&mut records, number, &mut drive).unwrap();
+        }
+        let (index, _) = build_index("/", &records).unwrap();
+        listing(&index)
+    }
+
+    #[test]
+    fn one_record_at_a_time_gives_the_same_index_as_the_whole_table() {
+        let mut real = Pieces::fixture();
+        let (whole, stats, _) = index_of(&mut real);
+        assert!(stats.files > 20);
+        assert_eq!(one_by_one(&mut real), listing(&whole));
+
+        let mut made = Memory(hand_made());
+        let (whole, _, _) = index_of(&mut made);
+        let mut found = one_by_one(&mut made);
+        // The hand-made volume has a record that was cut off mid-write.
+        // Read off the disk it fails its check and is skipped. A single
+        // record is taken on trust, because Windows hands those over with
+        // the check already done, and never hands over a torn one.
+        found.retain(|(path, _)| path != "/torn.txt");
+        assert_eq!(found, listing(&whole));
+    }
+
+    fn one_file() -> Vec<u8> {
+        record(
+            IN_USE,
+            None,
+            &[
+                attribute_list(&[(0x30, 0, 0, 40), (0x80, 0, 0, 41), (0x80, 0, 9, 42)]),
+                name_attribute(ROOT, "REPORT~1.PDF", 2),
+                name_attribute(ROOT, "report 2026.pdf", 1),
+                name_attribute(77, "second name.pdf", 1),
+                data_outside(0, 123_456, &run(31, 100)),
+            ],
+        )
+    }
+
+    #[test]
+    fn reads_one_record_on_its_own() {
+        let found = parse_file_record(&one_file()).unwrap();
+        assert!(found.in_use);
+        assert!(!found.is_dir);
+        assert_eq!(found.belongs_to, None);
+        assert_eq!(
+            found.names,
+            [
+                (ROOT, "report 2026.pdf".to_owned()),
+                (77, "second name.pdf".to_owned())
+            ]
+        );
+        assert_eq!(found.size, Some(123_456));
+        // Record 42 only holds a later stretch of the data, so it is not
+        // worth reading.
+        assert_eq!(found.continued_in, [40, 41]);
+        assert!(!found.list_elsewhere);
+    }
+
+    #[test]
+    fn reads_a_record_the_way_windows_hands_it_over() {
+        // Off the disk a record carries per-sector protection. Windows
+        // removes it before handing a record over.
+        let on_disk = one_file();
+        let mut from_windows = on_disk.clone();
+        assert!(apply_fixups(&mut from_windows));
+        assert_ne!(on_disk, from_windows);
+        assert_eq!(
+            parse_file_record(&from_windows),
+            parse_file_record(&on_disk)
+        );
+    }
+
+    #[test]
+    fn tells_folders_overflow_records_and_free_records_apart() {
+        let folder = record(FOLDER, None, &[name_attribute(ROOT, "Photos", 3)]);
+        let found = parse_file_record(&folder).unwrap();
+        assert!(found.is_dir);
+        assert_eq!(found.names, [(ROOT, "Photos".to_owned())]);
+        assert_eq!(found.size, None);
+
+        let overflow = record(IN_USE, Some(31), &[data_inside(12)]);
+        let found = parse_file_record(&overflow).unwrap();
+        assert_eq!(found.belongs_to, Some(31));
+        assert_eq!(found.size, Some(12));
+
+        let free = record(0, None, &[name_attribute(ROOT, "deleted.txt", 1)]);
+        assert!(!parse_file_record(&free).unwrap().in_use);
+
+        let listed_elsewhere = record(IN_USE, None, &[attribute_list_elsewhere()]);
+        assert!(parse_file_record(&listed_elsewhere).unwrap().list_elsewhere);
+
+        assert_eq!(parse_file_record(b"BAAD"), None);
+        assert_eq!(parse_file_record(&[]), None);
+        assert_eq!(parse_file_record(&vec![0u8; RECORD]), None);
+    }
+
+    #[test]
+    fn a_named_stream_is_not_the_files_size() {
+        let mut stream = data_inside(40);
+        stream[9] = 4; // a name four characters long
+        let file = record(
+            IN_USE,
+            None,
+            &[name_attribute(ROOT, "notes.txt", 1), stream, data_inside(9)],
+        );
+        assert_eq!(parse_file_record(&file).unwrap().size, Some(9));
+    }
+
+    #[test]
+    fn never_panics_on_a_damaged_record() {
+        let original = one_file();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..4000 {
+            let mut damaged = original.clone();
+            for _ in 0..(1 + next() % 6) {
+                // Mostly in the part that holds the attributes.
+                let at = (next() % 0x200) as usize;
+                damaged[at] = next() as u8;
+            }
+            // Sometimes cut short, too.
+            let keep = if round % 5 == 0 {
+                (next() % damaged.len() as u64) as usize
+            } else {
+                damaged.len()
+            };
+            let _ = parse_file_record(&damaged[..keep]);
+        }
     }
 }

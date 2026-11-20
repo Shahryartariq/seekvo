@@ -15,11 +15,14 @@
 //! each record instead; that has no sizes and one name per file, but it
 //! comes out of the system's cache when the drive was read recently.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io;
+use std::path::Path;
+use std::time::Duration;
 
 use crate::index::{BuildError, EntryId, Index, IndexBuilder, Kind};
+use crate::live::LiveError;
 use crate::mft::{FileTable, MftError};
 
 /// The low 48 bits of a file reference are the record's number in the
@@ -40,15 +43,38 @@ struct Row {
     name_start: usize,
     name_len: u32,
     is_dir: bool,
+    /// Replaced or removed since it was added; skipped everywhere.
+    dead: bool,
     size: u64,
 }
 
 /// File records as they come off a drive: unordered, each naming its parent
 /// by record number. All names share one buffer.
+///
+/// Once [`seal`](VolumeRecords::seal)ed, single records can be replaced or
+/// removed cheaply, which is how changes on the drive are followed.
 #[derive(Debug, Default)]
 pub struct VolumeRecords {
     names: String,
     rows: Vec<Row>,
+    /// After sealing: `rows[..sorted]` is in record-number order, so the
+    /// rows of one record are a binary search away.
+    sorted: usize,
+    sealed: bool,
+    /// After sealing: where the rows added since then are, by record number.
+    added: HashMap<u64, Vec<usize>>,
+    dead: usize,
+}
+
+/// One current row of a [`VolumeRecords`], for reading it back out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordRow<'a> {
+    pub record: u64,
+    /// Record number of the folder it is in.
+    pub parent: u64,
+    pub name: &'a str,
+    pub is_dir: bool,
+    pub size: u64,
 }
 
 impl VolumeRecords {
@@ -56,20 +82,57 @@ impl VolumeRecords {
         Self::default()
     }
 
+    /// Empty, with room set aside for `rows` rows and `name_bytes` bytes
+    /// of names.
+    pub(crate) fn with_room(rows: usize, name_bytes: usize) -> Self {
+        VolumeRecords {
+            names: String::with_capacity(name_bytes),
+            rows: Vec::with_capacity(rows),
+            ..Self::default()
+        }
+    }
+
+    /// Every current row. A file with two names appears twice.
+    pub fn iter(&self) -> impl Iterator<Item = RecordRow<'_>> {
+        self.rows
+            .iter()
+            .filter(|row| !row.dead)
+            .map(|row| RecordRow {
+                record: row.record,
+                parent: row.parent,
+                name: self.name(row),
+                is_dir: row.is_dir,
+                size: row.size,
+            })
+    }
+
+    /// Number of rows that are still current. A file with two names has two.
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.rows.len() - self.dead
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.len() == 0
     }
 
     /// Add one record. `file_reference` and `parent_reference` are the
     /// 64-bit NTFS file references.
     pub fn push(&mut self, file_reference: u64, parent_reference: u64, name: &str, is_dir: bool) {
+        self.push_sized(file_reference, parent_reference, name, is_dir, 0);
+    }
+
+    /// Add one record with a known size in bytes.
+    pub fn push_sized(
+        &mut self,
+        file_reference: u64,
+        parent_reference: u64,
+        name: &str,
+        is_dir: bool,
+        size: u64,
+    ) {
         let name_start = self.names.len();
         self.names.push_str(name);
-        self.push_row(file_reference, parent_reference, name_start, is_dir);
+        self.push_row(file_reference, parent_reference, name_start, is_dir, size);
     }
 
     pub(crate) fn push_utf16(
@@ -85,7 +148,7 @@ impl VolumeRecords {
         self.names.extend(
             char::decode_utf16(units).map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER)),
         );
-        self.push_row(file_reference, parent_reference, name_start, is_dir);
+        self.push_row(file_reference, parent_reference, name_start, is_dir, 0);
     }
 
     fn push_row(
@@ -94,16 +157,22 @@ impl VolumeRecords {
         parent_reference: u64,
         name_start: usize,
         is_dir: bool,
+        size: u64,
     ) {
         // An NTFS name is at most 255 UTF-16 units, far below u32.
         let name_len = (self.names.len() - name_start) as u32;
+        let record = file_reference & RECORD_NUMBER_MASK;
+        if self.sealed {
+            self.added.entry(record).or_default().push(self.rows.len());
+        }
         self.rows.push(Row {
-            record: file_reference & RECORD_NUMBER_MASK,
+            record,
             parent: parent_reference & RECORD_NUMBER_MASK,
             name_start,
             name_len,
             is_dir,
-            size: 0,
+            dead: false,
+            size,
         });
     }
 
@@ -121,6 +190,68 @@ impl VolumeRecords {
         });
     }
 
+    /// Get ready for single records to be replaced: drop what is no longer
+    /// current, put the rest in record-number order and reclaim the space
+    /// of dropped names. Call it once after loading, and again now and then
+    /// when many records have been replaced.
+    pub fn seal(&mut self) {
+        let mut names = String::with_capacity(self.names.len());
+        let mut rows: Vec<Row> = Vec::with_capacity(self.len());
+        for row in self.rows.iter().filter(|row| !row.dead) {
+            let name_start = names.len();
+            names.push_str(self.name(row));
+            rows.push(Row { name_start, ..*row });
+        }
+        // Stable, so a file's names stay in the order they were found.
+        rows.sort_by_key(|row| row.record);
+        self.names = names;
+        self.sorted = rows.len();
+        self.rows = rows;
+        self.sealed = true;
+        self.added.clear();
+        self.dead = 0;
+    }
+
+    /// Rows replaced or removed since the last [`seal`](Self::seal). They
+    /// still take up memory until the next one.
+    pub fn stale_rows(&self) -> usize {
+        self.dead
+    }
+
+    /// Positions of the current rows for one record number.
+    fn rows_of(&self, record: u64) -> Vec<usize> {
+        let record = record & RECORD_NUMBER_MASK;
+        let sorted = &self.rows[..self.sorted];
+        let first = sorted.partition_point(|row| row.record < record);
+        let count = sorted[first..].partition_point(|row| row.record == record);
+        let mut found: Vec<usize> = (first..first + count).collect();
+        if let Some(added) = self.added.get(&record) {
+            found.extend(added);
+        }
+        if !self.sealed {
+            // Not sorted yet, so look everywhere.
+            found = (0..self.rows.len())
+                .filter(|&i| self.rows[i].record == record)
+                .collect();
+        }
+        found.retain(|&i| !self.rows[i].dead);
+        found
+    }
+
+    /// Forget everything known about one record number.
+    pub fn remove_record(&mut self, record: u64) {
+        for i in self.rows_of(record) {
+            self.rows[i].dead = true;
+            self.dead += 1;
+        }
+        self.added.remove(&(record & RECORD_NUMBER_MASK));
+    }
+
+    /// The size last recorded for a record number, if it is known at all.
+    pub fn size_of(&self, record: u64) -> Option<u64> {
+        self.rows_of(record).first().map(|&i| self.rows[i].size)
+    }
+
     fn name(&self, row: &Row) -> &str {
         &self.names[row.name_start..row.name_start + row.name_len as usize]
     }
@@ -130,14 +261,24 @@ fn bytes_at<const N: usize>(buffer: &[u8], at: usize) -> Option<[u8; N]> {
     buffer.get(at..at.checked_add(N)?)?.try_into().ok()
 }
 
-/// Read one output buffer of `FSCTL_ENUM_USN_DATA` into `records`.
-///
-/// The buffer starts with the file reference to continue from, followed by
-/// version 2 change-journal records. Returns that reference, or `None` if
-/// the buffer is too short to hold one. Damaged or unknown records are
-/// skipped; parsing never reads outside the buffer.
-pub fn parse_usn_buffer(buffer: &[u8], records: &mut VolumeRecords) -> Option<u64> {
-    let next = u64::from_le_bytes(bytes_at(buffer, 0)?);
+/// One version 2 change-journal record, as far as this module needs it.
+struct UsnRecord<'a> {
+    file: u64,
+    parent: u64,
+    usn: i64,
+    /// When it happened, in 100-nanosecond steps since 1601 (a Windows
+    /// `FILETIME`).
+    time: i64,
+    reason: u32,
+    attributes: u32,
+    /// The file name as UTF-16, little-endian.
+    name: &'a [u8],
+}
+
+/// Walk the records that follow the 8-byte header of a change-journal
+/// buffer. Damaged or unknown records are skipped; nothing outside the
+/// buffer is ever read.
+fn for_each_usn_record(buffer: &[u8], mut visit: impl FnMut(UsnRecord<'_>)) {
     let mut at = 8usize;
     while let Some(length) = bytes_at(buffer, at).map(u32::from_le_bytes) {
         let length = length as usize;
@@ -154,26 +295,97 @@ pub fn parse_usn_buffer(buffer: &[u8], records: &mut VolumeRecords) -> Option<u6
         if major_version != Some(2) {
             continue;
         }
-        let (Some(file), Some(parent), Some(attributes), Some(name_len), Some(name_offset)) = (
+        let (
+            Some(file),
+            Some(parent),
+            Some(usn),
+            Some(time),
+            Some(reason),
+            Some(attributes),
+            Some(name_len),
+            Some(name_offset),
+        ) = (
             bytes_at(record, 8).map(u64::from_le_bytes),
             bytes_at(record, 16).map(u64::from_le_bytes),
+            bytes_at(record, 24).map(i64::from_le_bytes),
+            bytes_at(record, 32).map(i64::from_le_bytes),
+            bytes_at(record, 40).map(u32::from_le_bytes),
             bytes_at(record, 52).map(u32::from_le_bytes),
             bytes_at(record, 56).map(u16::from_le_bytes),
             bytes_at(record, 58).map(u16::from_le_bytes),
-        ) else {
+        )
+        else {
             continue;
         };
         let name_offset = name_offset as usize;
         let Some(name) = record.get(name_offset..name_offset + name_len as usize) else {
             continue;
         };
-        let units = name
+        visit(UsnRecord {
+            file,
+            parent,
+            usn,
+            time,
+            reason,
+            attributes,
+            name,
+        });
+    }
+}
+
+/// Read one output buffer of `FSCTL_ENUM_USN_DATA` into `records`.
+///
+/// The buffer starts with the file reference to continue from, followed by
+/// version 2 change-journal records. Returns that reference, or `None` if
+/// the buffer is too short to hold one. Damaged or unknown records are
+/// skipped; parsing never reads outside the buffer.
+pub fn parse_usn_buffer(buffer: &[u8], records: &mut VolumeRecords) -> Option<u64> {
+    let next = u64::from_le_bytes(bytes_at(buffer, 0)?);
+    for_each_usn_record(buffer, |record| {
+        let units = record
+            .name
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]));
-        let is_dir = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
-        records.push_utf16(file, parent, units, is_dir);
-    }
+        let is_dir = record.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        records.push_utf16(record.file, record.parent, units, is_dir);
+    });
     Some(next)
+}
+
+/// Something that happened to a file, as the drive's change journal
+/// recorded it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalEntry {
+    /// Record number of the file or folder it happened to.
+    pub record: u64,
+    /// Record number of the folder it was in at the time.
+    pub parent: u64,
+    /// The entry's position in the journal.
+    pub usn: i64,
+    /// When it happened, in 100-nanosecond steps since 1601.
+    pub time: i64,
+    /// What happened, as NTFS's `USN_REASON_*` bits.
+    pub reason: u32,
+}
+
+/// Read one output buffer of `FSCTL_READ_USN_JOURNAL`.
+///
+/// The buffer starts with the journal position to continue from, followed
+/// by the entries. Returns that position and the entries, or `None` if the
+/// buffer is too short to hold a position.
+pub fn parse_journal_buffer(buffer: &[u8]) -> Option<(i64, Vec<JournalEntry>)> {
+    let next = i64::from_le_bytes(bytes_at(buffer, 0)?);
+    let mut entries = Vec::new();
+    for_each_usn_record(buffer, |record| {
+        entries.push(JournalEntry {
+            record: record.file & RECORD_NUMBER_MASK,
+            parent: record.parent & RECORD_NUMBER_MASK,
+            usn: record.usn,
+            time: record.time,
+            reason: record.reason,
+        });
+    });
+    Some((next, entries))
 }
 
 /// Numbers from turning a drive's records into an index.
@@ -200,10 +412,10 @@ pub fn build_index(
 ) -> Result<(Index, VolumeStats), BuildError> {
     let rows = &records.rows;
     let mut order: Vec<usize> = (0..rows.len())
-        .filter(|&i| rows[i].record >= FIRST_ORDINARY_RECORD)
+        .filter(|&i| !rows[i].dead && rows[i].record >= FIRST_ORDINARY_RECORD)
         .collect();
     let mut stats = VolumeStats {
-        system: rows.len() - order.len(),
+        system: records.len() - order.len(),
         ..VolumeStats::default()
     };
     // Sorting by parent puts each folder's children next to each other, so
@@ -266,6 +478,8 @@ pub enum VolumeError {
     /// The file table could not be read directly.
     Table(MftError),
     Build(BuildError),
+    /// The drive was read, but its changes cannot be followed.
+    Live(LiveError),
 }
 
 impl fmt::Display for VolumeError {
@@ -286,6 +500,7 @@ impl fmt::Display for VolumeError {
             VolumeError::Io(error) => write!(f, "cannot read the drive: {error}"),
             VolumeError::Table(error) => write!(f, "{error}"),
             VolumeError::Build(error) => write!(f, "cannot build the index: {error}"),
+            VolumeError::Live(error) => write!(f, "{error}"),
         }
     }
 }
@@ -341,6 +556,172 @@ pub fn read_volume(drive: char) -> Result<(Index, VolumeStats), VolumeError> {
     build_index(&root, &table.records).map_err(VolumeError::Build)
 }
 
+/// An index of an NTFS drive that follows the drive as files change.
+///
+/// Opening it reads the whole file table once. After that,
+/// [`poll`](LiveDrive::poll) asks the drive's change journal what happened
+/// since the last call, which costs next to nothing when nothing did.
+/// Needs Windows and an administrator.
+pub struct LiveDrive {
+    #[cfg(windows)]
+    inner: crate::live::Live<windows::Followed>,
+    #[cfg(not(windows))]
+    never: std::convert::Infallible,
+}
+
+/// Where a [`LiveDrive`]'s index came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    /// Loaded from the saved file, then brought up to date from the
+    /// drive's change journal. The drive itself was not read.
+    FromSaved,
+    /// Read from the drive in full, because the saved file could not be
+    /// used. Says why.
+    ReadInFull(String),
+}
+
+impl LiveDrive {
+    /// Read a drive, given its letter, and start following it.
+    pub fn open(drive: char) -> Result<Self, VolumeError> {
+        if !drive.is_ascii_alphabetic() {
+            return Err(VolumeError::BadDrive(drive));
+        }
+        #[cfg(windows)]
+        {
+            let inner = windows::follow(drive.to_ascii_uppercase())?;
+            Ok(LiveDrive { inner })
+        }
+        #[cfg(not(windows))]
+        {
+            Err(VolumeError::Unsupported)
+        }
+    }
+
+    /// Start following a drive from an index [`save`](Self::save)d
+    /// earlier, without reading the drive.
+    ///
+    /// Everything that happened on the drive since the save is taken in
+    /// from its change journal. When the saved file is missing, damaged,
+    /// from another drive, or older than the journal goes back, the drive
+    /// is read in full instead, exactly as [`open`](Self::open) does.
+    pub fn open_saved(drive: char, saved: &Path) -> Result<(Self, Start), VolumeError> {
+        if !drive.is_ascii_alphabetic() {
+            return Err(VolumeError::BadDrive(drive));
+        }
+        #[cfg(windows)]
+        {
+            let drive = drive.to_ascii_uppercase();
+            let why = match std::fs::File::open(saved) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    "nothing has been saved yet".to_owned()
+                }
+                Err(error) => format!("the saved index cannot be opened: {error}"),
+                Ok(mut file) => match crate::snapshot::read(&mut file) {
+                    Err(error) => error.to_string(),
+                    Ok(saved) => match windows::resume(drive, saved)? {
+                        Ok(inner) => return Ok((LiveDrive { inner }, Start::FromSaved)),
+                        Err(why) => why.to_owned(),
+                    },
+                },
+            };
+            let inner = windows::follow(drive)?;
+            Ok((LiveDrive { inner }, Start::ReadInFull(why)))
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = saved;
+            Err(VolumeError::Unsupported)
+        }
+    }
+
+    /// Save the index as it is now, for [`open_saved`](Self::open_saved).
+    ///
+    /// The file is written under another name first and then moved into
+    /// place, so a crash halfway leaves the previous save intact.
+    pub fn save(&self, saved: &Path) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            let origin = self.inner.volume().origin(self.inner.cursor());
+            let mut partial = saved.as_os_str().to_owned();
+            partial.push(".partial");
+            let partial = std::path::PathBuf::from(partial);
+            let mut file = std::fs::File::create(&partial)?;
+            crate::snapshot::write(&mut file, self.inner.records(), origin)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&partial, saved)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = saved;
+            match self.never {}
+        }
+    }
+
+    /// How long catching up took while opening.
+    pub fn caught_up_in(&self) -> Duration {
+        #[cfg(windows)]
+        {
+            self.inner.caught_up_in()
+        }
+        #[cfg(not(windows))]
+        {
+            match self.never {}
+        }
+    }
+
+    /// Take in what changed on the drive since the last call. Returns how
+    /// many files and folders were looked at again; 0 means nothing
+    /// changed.
+    pub fn poll(&mut self) -> Result<usize, LiveError> {
+        #[cfg(windows)]
+        {
+            self.inner.poll()
+        }
+        #[cfg(not(windows))]
+        {
+            match self.never {}
+        }
+    }
+
+    /// The index, rebuilt first if a poll changed anything.
+    pub fn index(&mut self) -> Result<&Index, LiveError> {
+        #[cfg(windows)]
+        {
+            self.inner.index()
+        }
+        #[cfg(not(windows))]
+        {
+            match self.never {}
+        }
+    }
+
+    /// Counts from the last time the index was built.
+    pub fn stats(&self) -> VolumeStats {
+        #[cfg(windows)]
+        {
+            self.inner.stats()
+        }
+        #[cfg(not(windows))]
+        {
+            match self.never {}
+        }
+    }
+
+    /// How many records were looked at again while opening, to catch up
+    /// with changes made around the time the drive was read.
+    pub fn caught_up(&self) -> usize {
+        #[cfg(windows)]
+        {
+            self.inner.caught_up()
+        }
+        #[cfg(not(windows))]
+        {
+            match self.never {}
+        }
+    }
+}
+
 // `seekvo_check_windows` lets the Windows code be type-checked on other
 // systems with `RUSTFLAGS="--cfg seekvo_check_windows" cargo check`.
 #[cfg(any(windows, seekvo_check_windows))]
@@ -350,8 +731,15 @@ mod windows {
     use std::io;
     use std::ptr;
 
-    use super::{VolumeError, VolumeRecords, parse_usn_buffer};
+    use super::{
+        RECORD_NUMBER_MASK, VolumeError, VolumeRecords, bytes_at, parse_journal_buffer,
+        parse_usn_buffer,
+    };
+    use crate::live::{
+        Journal, JournalBatch, JournalError, Live, LiveError, RecordSource, filetime_now,
+    };
     use crate::mft::{self, BlockSource, FileTable};
+    use crate::snapshot::{Origin, Saved};
 
     type Handle = *mut c_void;
 
@@ -362,8 +750,21 @@ mod windows {
     const FILE_SHARE_DELETE: u32 = 0x4;
     const OPEN_EXISTING: u32 = 3;
     const FSCTL_ENUM_USN_DATA: u32 = 0x0009_00B3;
+    const FSCTL_QUERY_USN_JOURNAL: u32 = 0x0009_00F4;
+    const FSCTL_READ_USN_JOURNAL: u32 = 0x0009_00BB;
+    const FSCTL_GET_NTFS_FILE_RECORD: u32 = 0x0009_0068;
     const ERROR_ACCESS_DENIED: i32 = 5;
     const ERROR_HANDLE_EOF: i32 = 38;
+    const ERROR_INVALID_PARAMETER: i32 = 87;
+    const ERROR_JOURNAL_DELETE_IN_PROGRESS: i32 = 1178;
+    const ERROR_JOURNAL_NOT_ACTIVE: i32 = 1179;
+    const ERROR_JOURNAL_ENTRY_DELETED: i32 = 1181;
+    /// Room for one file record and the 12 bytes Windows puts before it.
+    /// Records are 1 KB on most drives and 4 KB on some.
+    const RECORD_BUFFER_BYTES: usize = 1 << 16;
+    /// Changes this long before the full read began are looked at again
+    /// afterwards, in 100-nanosecond steps: two minutes.
+    const REPLAY_MARGIN: i64 = 120 * 10_000_000;
     const FILE_BEGIN: u32 = 0;
     /// The most to ask `ReadFile` for at once; a whole number of sectors.
     const READ_LIMIT: usize = 1 << 30;
@@ -377,6 +778,30 @@ mod windows {
         start_file_reference: u64,
         low_usn: i64,
         high_usn: i64,
+    }
+
+    /// `USN_JOURNAL_DATA_V0`: what a drive says about its change journal.
+    #[repr(C)]
+    #[derive(Default)]
+    struct JournalData {
+        journal_id: u64,
+        first_usn: i64,
+        next_usn: i64,
+        lowest_valid_usn: i64,
+        max_usn: i64,
+        maximum_size: u64,
+        allocation_delta: u64,
+    }
+
+    /// `READ_USN_JOURNAL_DATA_V0`: where to read the journal from.
+    #[repr(C)]
+    struct ReadJournal {
+        start_usn: i64,
+        reason_mask: u32,
+        return_only_on_close: u32,
+        timeout: u64,
+        bytes_to_wait_for: u64,
+        journal_id: u64,
     }
 
     #[link(name = "kernel32")]
@@ -431,8 +856,8 @@ mod windows {
         fn CloseHandle(object: Handle) -> i32;
     }
 
-    /// An open drive that closes itself.
-    struct Volume(Handle);
+    /// An open drive that closes itself, and its serial number.
+    struct Volume(Handle, u32);
 
     impl Drop for Volume {
         fn drop(&mut self) {
@@ -484,9 +909,11 @@ mod windows {
         text.encode_utf16().chain([0]).collect()
     }
 
-    fn file_system_of(root: &str) -> io::Result<String> {
+    /// The name of a drive's file system, and the drive's serial number.
+    fn file_system_of(root: &str) -> io::Result<(String, u32)> {
         let root = wide(root);
         let mut name = [0u16; 64];
+        let mut serial = 0u32;
         // SAFETY: `root` is NUL-terminated, `name` is writable for the
         // length passed, and the other outputs are allowed to be null.
         let ok = unsafe {
@@ -494,7 +921,7 @@ mod windows {
                 root.as_ptr(),
                 ptr::null_mut(),
                 0,
-                ptr::null_mut(),
+                &mut serial,
                 ptr::null_mut(),
                 ptr::null_mut(),
                 name.as_mut_ptr(),
@@ -508,13 +935,13 @@ mod windows {
             .iter()
             .position(|&unit| unit == 0)
             .unwrap_or(name.len());
-        Ok(String::from_utf16_lossy(&name[..length]))
+        Ok((String::from_utf16_lossy(&name[..length]), serial))
     }
 
     /// Open a drive for reading, after checking it is NTFS.
     fn open(drive: char) -> Result<Volume, VolumeError> {
         let root = format!("{drive}:\\");
-        let file_system = file_system_of(&root).map_err(VolumeError::Io)?;
+        let (file_system, serial) = file_system_of(&root).map_err(VolumeError::Io)?;
         if file_system != "NTFS" {
             return Err(VolumeError::NotNtfs(file_system));
         }
@@ -541,7 +968,7 @@ mod windows {
                 VolumeError::Io(error)
             });
         }
-        Ok(Volume(handle))
+        Ok(Volume(handle, serial))
     }
 
     pub(super) fn read_file_table(drive: char) -> Result<FileTable, VolumeError> {
@@ -596,6 +1023,208 @@ mod windows {
             }
         }
         Ok(records)
+    }
+
+    /// An open drive whose single records and change journal can be read.
+    pub(super) struct Followed {
+        volume: Volume,
+        journal_id: u64,
+        // u64 elements keep both buffers aligned for what Windows writes
+        // into them.
+        record: Vec<u64>,
+        journal: Vec<u64>,
+    }
+
+    /// The bytes Windows wrote into the front of a buffer.
+    fn filled(buffer: &[u64], returned: u32) -> &[u8] {
+        let length = (returned as usize).min(buffer.len() * 8);
+        // SAFETY: `length` is at most the buffer's size in bytes, and u8
+        // has no alignment requirement.
+        unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), length) }
+    }
+
+    impl RecordSource for Followed {
+        fn file_record(&mut self, number: u64) -> io::Result<Option<Vec<u8>>> {
+            let wanted = number & RECORD_NUMBER_MASK;
+            let mut returned = 0u32;
+            // SAFETY: the input is 8 readable bytes, the output buffer is
+            // writable for the size passed, and both live across the call.
+            let ok = unsafe {
+                DeviceIoControl(
+                    self.volume.0,
+                    FSCTL_GET_NTFS_FILE_RECORD,
+                    ptr::from_ref(&wanted).cast(),
+                    size_of::<u64>() as u32,
+                    self.record.as_mut_ptr().cast(),
+                    RECORD_BUFFER_BYTES as u32,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let error = io::Error::last_os_error();
+                return match error.raw_os_error() {
+                    // Past the end of the table: no such record.
+                    Some(ERROR_INVALID_PARAMETER | ERROR_HANDLE_EOF) => Ok(None),
+                    _ => Err(error),
+                };
+            }
+            let bytes = filled(&self.record, returned);
+            let (Some(found), Some(length)) = (
+                bytes_at(bytes, 0).map(u64::from_le_bytes),
+                bytes_at(bytes, 8).map(u32::from_le_bytes),
+            ) else {
+                return Ok(None);
+            };
+            // When the record asked for is not in use, Windows hands over
+            // the nearest one below it that is.
+            if found & RECORD_NUMBER_MASK != wanted {
+                return Ok(None);
+            }
+            Ok(bytes.get(12..12 + length as usize).map(<[u8]>::to_vec))
+        }
+    }
+
+    impl Journal for Followed {
+        fn read_from(&mut self, from: i64) -> Result<JournalBatch, JournalError> {
+            let request = ReadJournal {
+                start_usn: from,
+                reason_mask: u32::MAX,
+                return_only_on_close: 0,
+                // Return at once, also when there is nothing new.
+                timeout: 0,
+                bytes_to_wait_for: 0,
+                journal_id: self.journal_id,
+            };
+            let mut returned = 0u32;
+            // SAFETY: `request` and the output buffer are valid for the
+            // sizes passed and live across the call.
+            let ok = unsafe {
+                DeviceIoControl(
+                    self.volume.0,
+                    FSCTL_READ_USN_JOURNAL,
+                    ptr::from_ref(&request).cast(),
+                    size_of::<ReadJournal>() as u32,
+                    self.journal.as_mut_ptr().cast(),
+                    BUFFER_BYTES as u32,
+                    &mut returned,
+                    ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(journal_error(io::Error::last_os_error()));
+            }
+            let (next, entries) = parse_journal_buffer(filled(&self.journal, returned))
+                .ok_or_else(|| JournalError::Io(io::Error::from(io::ErrorKind::InvalidData)))?;
+            Ok(JournalBatch { next, entries })
+        }
+    }
+
+    fn journal_error(error: io::Error) -> JournalError {
+        match error.raw_os_error() {
+            Some(ERROR_JOURNAL_NOT_ACTIVE | ERROR_JOURNAL_DELETE_IN_PROGRESS) => {
+                JournalError::NotActive
+            }
+            // The place to continue from is gone, or the journal was
+            // deleted and made again under a new id.
+            Some(ERROR_JOURNAL_ENTRY_DELETED | ERROR_INVALID_PARAMETER) => JournalError::Expired,
+            _ => JournalError::Io(error),
+        }
+    }
+
+    fn journal_of(volume: &Volume) -> Result<JournalData, JournalError> {
+        let mut data = JournalData::default();
+        let mut returned = 0u32;
+        // SAFETY: there is no input, and `data` is writable for its size.
+        let ok = unsafe {
+            DeviceIoControl(
+                volume.0,
+                FSCTL_QUERY_USN_JOURNAL,
+                ptr::null(),
+                0,
+                ptr::from_mut(&mut data).cast(),
+                size_of::<JournalData>() as u32,
+                &mut returned,
+                ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(journal_error(io::Error::last_os_error()));
+        }
+        Ok(data)
+    }
+
+    impl Followed {
+        /// What to note in a saved index, so it is only ever used for this
+        /// drive and this journal.
+        pub(super) fn origin(&self, cursor: i64) -> Origin {
+            Origin {
+                volume_serial: self.volume.1,
+                journal_id: self.journal_id,
+                cursor,
+            }
+        }
+    }
+
+    fn followed(volume: Volume, journal: &JournalData) -> Followed {
+        Followed {
+            volume,
+            journal_id: journal.journal_id,
+            record: vec![0u64; RECORD_BUFFER_BYTES / 8],
+            journal: vec![0u64; BUFFER_BYTES / 8],
+        }
+    }
+
+    fn journal_or_error(volume: &Volume) -> Result<JournalData, VolumeError> {
+        journal_of(volume).map_err(|error| VolumeError::Live(LiveError::Journal(error)))
+    }
+
+    /// Read a drive in full and start following its change journal.
+    pub(super) fn follow(drive: char) -> Result<Live<Followed>, VolumeError> {
+        let replay_since = filetime_now() - REPLAY_MARGIN;
+        let mut volume = open(drive)?;
+        let journal = journal_or_error(&volume)?;
+        let table = mft::read_file_table(&mut volume).map_err(VolumeError::Table)?;
+        let root = format!("{drive}:\\");
+        Live::start(
+            followed(volume, &journal),
+            table.records,
+            &root,
+            replay_since,
+        )
+        .map_err(VolumeError::Live)
+    }
+
+    /// Carry on from a saved index. The inner error says why the saved
+    /// index cannot be used for this drive as it is now.
+    pub(super) fn resume(
+        drive: char,
+        saved: Saved,
+    ) -> Result<Result<Live<Followed>, &'static str>, VolumeError> {
+        const TOO_OLD: &str = "the drive's change journal no longer goes back to the last save";
+        let volume = open(drive)?;
+        let journal = journal_or_error(&volume)?;
+        let origin = saved.origin;
+        if origin.volume_serial != volume.1 {
+            return Ok(Err("the saved index is from another drive"));
+        }
+        if origin.journal_id != journal.journal_id
+            || origin.cursor < journal.first_usn
+            || origin.cursor > journal.next_usn
+        {
+            return Ok(Err(TOO_OLD));
+        }
+        let root = format!("{drive}:\\");
+        match Live::resume(
+            followed(volume, &journal),
+            saved.records,
+            &root,
+            origin.cursor,
+        ) {
+            Ok(live) => Ok(Ok(live)),
+            Err(LiveError::Journal(JournalError::Expired)) => Ok(Err(TOO_OLD)),
+            Err(other) => Err(VolumeError::Live(other)),
+        }
     }
 }
 
@@ -743,6 +1372,110 @@ mod tests {
             record[at..at + 2].copy_from_slice(&unit.to_le_bytes());
         }
         record
+    }
+
+    fn names_of(records: &VolumeRecords, record: u64) -> Vec<String> {
+        records
+            .rows_of(record)
+            .iter()
+            .map(|&i| records.name(&records.rows[i]).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn replaces_and_removes_single_records() {
+        let mut records = VolumeRecords::new();
+        // Out of order on purpose; record 40 has two names.
+        records.push_sized(40, ROOT_RECORD, "b.txt", false, 7);
+        records.push_sized(30, ROOT_RECORD, "Docs", true, 0);
+        records.push_sized(40, 30, "also-b.txt", false, 7);
+        records.push_sized(35, 30, "a.txt", false, 3);
+        // Before sealing, single records can be found, only slowly.
+        assert_eq!(names_of(&records, 40), ["b.txt", "also-b.txt"]);
+
+        records.seal();
+        assert_eq!(records.len(), 4);
+        assert_eq!(names_of(&records, 40), ["b.txt", "also-b.txt"]);
+        assert_eq!(records.size_of(40), Some(7));
+        assert_eq!(records.size_of(99), None);
+
+        // Replace record 40 with one name, and add a new record.
+        records.remove_record(40);
+        assert_eq!(names_of(&records, 40), [] as [&str; 0]);
+        records.push_sized(40, 30, "renamed.txt", false, 8);
+        records.push_sized(50, ROOT_RECORD, "new.txt", false, 1);
+        assert_eq!(names_of(&records, 40), ["renamed.txt"]);
+        assert_eq!(records.size_of(40), Some(8));
+        assert_eq!(records.len(), 4);
+        assert_eq!(records.stale_rows(), 2);
+
+        // Replace it again: the row added after sealing goes too.
+        records.remove_record(40);
+        records.push_sized(40, 30, "final.txt", false, 9);
+        assert_eq!(names_of(&records, 40), ["final.txt"]);
+
+        let (index, stats) = build_index("/", &records).unwrap();
+        assert_eq!(stats.files, 3);
+        assert_eq!(stats.dirs, 2);
+        assert_eq!(
+            paths(&index),
+            ["/", "/Docs", "/new.txt", "/Docs/a.txt", "/Docs/final.txt"]
+        );
+
+        // Tidying up changes nothing that can be seen.
+        records.seal();
+        assert_eq!(records.stale_rows(), 0);
+        assert_eq!(records.len(), 4);
+        assert_eq!(names_of(&records, 40), ["final.txt"]);
+        let (again, _) = build_index("/", &records).unwrap();
+        assert_eq!(paths(&again), paths(&index));
+    }
+
+    #[test]
+    fn parses_a_buffer_of_journal_entries() {
+        let mut first = usn_record(reference(40), reference(5), 0, &utf16("a.txt"));
+        first[24..32].copy_from_slice(&1_000i64.to_le_bytes());
+        first[32..40].copy_from_slice(&134_000_000_000_000_000i64.to_le_bytes());
+        first[40..44].copy_from_slice(&0x100u32.to_le_bytes());
+        let mut second = usn_record(reference(41), reference(40), 0x10, &utf16("Docs"));
+        second[24..32].copy_from_slice(&1_080i64.to_le_bytes());
+        second[40..44].copy_from_slice(&0x8000_0200u32.to_le_bytes());
+
+        let mut buffer = 1_160i64.to_le_bytes().to_vec();
+        buffer.extend(&first);
+        buffer.extend(&second);
+
+        let (next, entries) = parse_journal_buffer(&buffer).unwrap();
+        assert_eq!(next, 1_160);
+        assert_eq!(
+            entries,
+            [
+                JournalEntry {
+                    record: 40,
+                    parent: 5,
+                    usn: 1_000,
+                    time: 134_000_000_000_000_000,
+                    reason: 0x100,
+                },
+                JournalEntry {
+                    record: 41,
+                    parent: 40,
+                    usn: 1_080,
+                    time: 0,
+                    reason: 0x8000_0200,
+                },
+            ]
+        );
+
+        // Nothing new: only the position comes back.
+        assert_eq!(
+            parse_journal_buffer(&1_160i64.to_le_bytes()),
+            Some((1_160, Vec::new()))
+        );
+        assert_eq!(parse_journal_buffer(&[1, 2, 3]), None);
+        // Cut off in the middle of an entry: what came before still counts.
+        let (_, entries) = parse_journal_buffer(&buffer[..buffer.len() - 10]).unwrap();
+        assert_eq!(entries.len(), 1);
     }
 
     fn utf16(text: &str) -> Vec<u16> {
@@ -982,5 +1715,264 @@ mod tests {
                 marker_path
             );
         }
+    }
+
+    /// Everything the index has under `folder`, as (path below the folder,
+    /// size), sorted. `folder` is a plain lowercase path.
+    #[cfg(windows)]
+    fn inside(live: &mut LiveDrive, folder: &str) -> Vec<(String, u64)> {
+        use crate::query::{Query, Scope};
+        let marker = folder.rsplit('\\').next().unwrap();
+        let index = live.index().unwrap();
+        let query = Query::parse(marker).with_scope(Scope::Path);
+        let prefix = format!("{folder}\\");
+        let mut found: Vec<(String, u64)> = index
+            .search(&query, 1000)
+            .hits
+            .iter()
+            .filter_map(|&id| {
+                let path = index.path(id)?.to_lowercase();
+                let below = path.strip_prefix(&prefix)?.to_owned();
+                Some((below, index.size(id)?))
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// Poll until the index shows exactly `expected` under `folder`. The
+    /// journal is written as part of each change, so the first poll is
+    /// normally enough; the retries allow for a slow machine.
+    #[cfg(windows)]
+    fn expect_inside(live: &mut LiveDrive, folder: &str, expected: &[(&str, u64)]) {
+        let expected: Vec<(String, u64)> = expected
+            .iter()
+            .map(|&(path, size)| (path.to_owned(), size))
+            .collect();
+        let mut found = Vec::new();
+        for _ in 0..50 {
+            live.poll().unwrap();
+            found = inside(live, folder);
+            if found == expected {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert_eq!(found, expected);
+    }
+
+    /// A new, empty folder on `drive` for a test to change files in.
+    #[cfg(windows)]
+    fn scratch_folder(drive: char, name: &str) -> std::path::PathBuf {
+        use std::fs;
+        // The temporary folder is usually on the system drive; if not, a
+        // folder everyone can write to on that drive will do.
+        let temp = fs::canonicalize(std::env::temp_dir()).unwrap();
+        let base = if plain(&temp).starts_with(&format!("{drive}:").to_lowercase()) {
+            temp
+        } else {
+            fs::canonicalize(format!("{drive}:\\Users\\Public")).unwrap()
+        };
+        let folder = base.join(format!("{name}-{}", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        folder
+    }
+
+    /// Stop watching, change files, start again from the saved index: the
+    /// changes made in between have to be there, without reading the drive.
+    #[test]
+    #[cfg(windows)]
+    fn picks_up_what_changed_while_nothing_was_watching() {
+        use std::fs;
+
+        let drive = system_drive();
+        let folder = scratch_folder(drive, "seekvo-saved-test");
+        let shown = plain(&folder);
+        let saved = folder.with_extension("saved");
+        fs::write(folder.join("stays.txt"), b"1").unwrap();
+        fs::write(folder.join("goes.txt"), b"22").unwrap();
+
+        let (mut live, start) = match LiveDrive::open_saved(drive, &saved) {
+            Ok(opened) => opened,
+            Err(VolumeError::NeedsAdmin) => {
+                eprintln!("skipped: needs an administrator");
+                let _ = fs::remove_dir_all(&folder);
+                return;
+            }
+            Err(other) => panic!("{other}"),
+        };
+        assert_eq!(
+            start,
+            Start::ReadInFull("nothing has been saved yet".to_owned())
+        );
+        expect_inside(&mut live, &shown, &[("goes.txt", 2), ("stays.txt", 1)]);
+        live.save(&saved).unwrap();
+        drop(live);
+
+        // Nothing is watching now.
+        fs::remove_file(folder.join("goes.txt")).unwrap();
+        fs::rename(folder.join("stays.txt"), folder.join("kept.txt")).unwrap();
+        fs::write(folder.join("arrived.bin"), vec![1u8; 5_000]).unwrap();
+
+        let (mut live, start) = LiveDrive::open_saved(drive, &saved).unwrap();
+        assert_eq!(start, Start::FromSaved);
+        // Up to date as soon as it opens, before any poll.
+        assert_eq!(
+            inside(&mut live, &shown),
+            [
+                ("arrived.bin".to_owned(), 5_000),
+                ("kept.txt".to_owned(), 1)
+            ]
+        );
+        // And it keeps following from there.
+        fs::remove_file(folder.join("arrived.bin")).unwrap();
+        expect_inside(&mut live, &shown, &[("kept.txt", 1)]);
+        drop(live);
+
+        // A saved file that has been damaged is not trusted: the drive is
+        // read again instead.
+        let mut bytes = fs::read(&saved).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xFF;
+        fs::write(&saved, bytes).unwrap();
+        let (mut live, start) = LiveDrive::open_saved(drive, &saved).unwrap();
+        assert_eq!(
+            start,
+            Start::ReadInFull("the saved index is damaged".to_owned())
+        );
+        expect_inside(&mut live, &shown, &[("kept.txt", 1)]);
+
+        fs::remove_file(&saved).unwrap();
+        fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// The real thing: change files on the machine's own system drive and
+    /// check the index follows. Needs an administrator, like the test above.
+    #[test]
+    #[cfg(windows)]
+    fn follows_changes_on_the_system_drive() {
+        use std::fs;
+        use std::io::Write;
+
+        let drive = system_drive();
+        let folder = scratch_folder(drive, "seekvo-live-test");
+        let shown = plain(&folder);
+
+        // Written a moment before the drive is read, so the table on disk
+        // may not have it yet. Catching up from the journal has to find it.
+        fs::write(folder.join("early.txt"), b"12345").unwrap();
+
+        let mut live = match LiveDrive::open(drive) {
+            Ok(live) => live,
+            Err(VolumeError::NeedsAdmin) => {
+                eprintln!("skipped: needs an administrator");
+                let _ = fs::remove_dir_all(&folder);
+                return;
+            }
+            Err(other) => panic!("{other}"),
+        };
+        expect_inside(&mut live, &shown, &[("early.txt", 5)]);
+
+        // A new file, big enough that its data is stored outside its record.
+        fs::write(folder.join("report.bin"), vec![7u8; 3_000]).unwrap();
+        expect_inside(
+            &mut live,
+            &shown,
+            &[("early.txt", 5), ("report.bin", 3_000)],
+        );
+
+        // It grows.
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(folder.join("report.bin"))
+            .unwrap();
+        file.write_all(&vec![7u8; 67_000]).unwrap();
+        drop(file);
+        expect_inside(
+            &mut live,
+            &shown,
+            &[("early.txt", 5), ("report.bin", 70_000)],
+        );
+
+        // It is renamed.
+        fs::rename(folder.join("report.bin"), folder.join("final.bin")).unwrap();
+        expect_inside(
+            &mut live,
+            &shown,
+            &[("early.txt", 5), ("final.bin", 70_000)],
+        );
+
+        // It moves into a new folder.
+        fs::create_dir(folder.join("archive")).unwrap();
+        fs::rename(
+            folder.join("final.bin"),
+            folder.join("archive").join("final.bin"),
+        )
+        .unwrap();
+        expect_inside(
+            &mut live,
+            &shown,
+            &[
+                ("archive", 0),
+                ("archive\\final.bin", 70_000),
+                ("early.txt", 5),
+            ],
+        );
+
+        // The folder is renamed; the file inside follows.
+        fs::rename(folder.join("archive"), folder.join("2026")).unwrap();
+        expect_inside(
+            &mut live,
+            &shown,
+            &[("2026", 0), ("2026\\final.bin", 70_000), ("early.txt", 5)],
+        );
+
+        // It gets a second name.
+        fs::hard_link(
+            folder.join("2026").join("final.bin"),
+            folder.join("also.bin"),
+        )
+        .unwrap();
+        expect_inside(
+            &mut live,
+            &shown,
+            &[
+                ("2026", 0),
+                ("2026\\final.bin", 70_000),
+                ("also.bin", 70_000),
+                ("early.txt", 5),
+            ],
+        );
+
+        // Everything but the first file is deleted.
+        fs::remove_file(folder.join("also.bin")).unwrap();
+        fs::remove_dir_all(folder.join("2026")).unwrap();
+        expect_inside(&mut live, &shown, &[("early.txt", 5)]);
+
+        fs::remove_dir_all(&folder).unwrap();
+        expect_inside(&mut live, &shown, &[]);
+    }
+
+    #[test]
+    fn following_a_drive_says_so_when_not_on_windows() {
+        assert!(matches!(
+            LiveDrive::open('1'),
+            Err(VolumeError::BadDrive('1'))
+        ));
+        #[cfg(not(windows))]
+        {
+            assert!(matches!(
+                LiveDrive::open('C'),
+                Err(VolumeError::Unsupported)
+            ));
+            assert!(matches!(
+                LiveDrive::open_saved('C', Path::new("saved")),
+                Err(VolumeError::Unsupported)
+            ));
+        }
+        assert!(matches!(
+            LiveDrive::open_saved('?', Path::new("saved")),
+            Err(VolumeError::BadDrive('?'))
+        ));
     }
 }

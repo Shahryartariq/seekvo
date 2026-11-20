@@ -10,10 +10,12 @@
 //! - [`synthetic`] builds a made-up drive of any size for benchmarks.
 
 pub mod index;
+pub mod live;
 pub mod mft;
 pub mod ntfs;
 pub mod query;
 pub mod scan;
+pub mod snapshot;
 pub mod synthetic;
 
 pub use index::{BuildError, EntryId, Index, IndexBuilder, Kind, SearchResult};

@@ -9,14 +9,21 @@ app itself.
 - **Search** across that index: several words in any order, any letter case, and an `ext:` filter.
 - **A whole-drive reader for NTFS.** It reads the drive's file table directly instead of walking
   folders, and gets every file's size and every name of a hard-linked file. On a real Windows
-  drive with 1.4 million files and folders the first read took about 10 seconds.
+  drive with 1.4 million files and folders the first read took 9 to 14 seconds in eight runs
+  out of nine.
+- **Following changes.** After the first read the index follows the drive's change journal. A
+  file that is created, renamed, moved, resized or deleted is in the index at the next poll,
+  with no rescan.
+- **A saved index.** The index can be written to a file. The next start loads it and catches up
+  from the change journal instead of reading the drive: about a second on the same drive.
 - **An image reader.** The same code indexes an NTFS volume saved as an image file, on any
   system.
 - **A folder scanner** that fills the index by walking a folder. It runs on Windows, macOS and
   Linux and needs no special rights.
 - **A command-line tool** to try all of this and to run the benchmark.
 
-Not built yet: following changes live, saving the index to disk, and ranking results.
+Not built yet: ranking results, and updating the index in place when a file changes (today it
+is rebuilt, which takes most of a second on a big drive).
 
 ## Try it
 
@@ -29,6 +36,10 @@ cd engine
 # Windows only, from an administrator terminal.
 cargo run --release -- drive C invoice 2026
 
+# Index C:, then keep the index current and repeat the search whenever a file changes.
+# With --saved, the next start loads the index from that file instead of reading the drive.
+cargo run --release -- watch C invoice 2026 --saved c-drive.seekvo
+
 # Index one folder, then search it. Works anywhere, no administrator needed.
 cargo run --release -- scan C:\Users\you\Documents report ext:pdf
 
@@ -40,7 +51,7 @@ cargo run --release -- bench
 ```
 
 Reading a drive's file table is something Windows only allows administrators to do. The tool
-only reads; it never writes to the drive.
+only reads the drive. The one thing it writes is the saved index, and only to the file you name.
 
 ## How a search matches
 
@@ -89,35 +100,92 @@ a healthy one does not have, and on the real table with random bytes flipped, 40
 to check that damage produces an error or a shorter listing and never a crash. On Windows a
 further test reads the real system drive and compares file sizes with what Windows reports.
 
-Two things to know:
+`--reader records` uses the earlier method, which asks Windows for a summary of each record
+(`FSCTL_ENUM_USN_DATA`). It has no sizes and one name per file.
 
-- The drive is read below the file system, so a file created in the last few seconds may not
-  have reached the table on disk yet. Following the change journal, which is next, closes that
-  gap.
-- `--reader records` uses the earlier method, which asks Windows for a summary of each record
-  (`FSCTL_ENUM_USN_DATA`). It has no sizes and one name per file.
+### Staying current
+
+NTFS writes a line to its change journal every time a file is created, renamed, moved, written
+to or deleted. `src/live.rs` reads the journal from where it last stopped. That costs almost
+nothing when nothing happened, however large the drive is.
+
+The journal says which records changed. For each one the engine asks Windows for the record as
+it is now (`FSCTL_GET_NTFS_FILE_RECORD`) and replaces what it knew about that file. It does not
+try to replay "this was a rename, that was a delete". One step covers a new file, a new name, a
+move, a second name, a new size and a delete, and a journal line that is read twice does no
+harm. Renaming a folder touches one record; everything inside follows because children point
+to their folder by number.
+
+The first read has a gap of its own: the table is read below the file system, so a file saved
+a few seconds earlier may not be in the table on disk yet. To close it, every record the
+journal mentions from two minutes before the read began is looked at again once the read is
+done.
+
+### Starting without reading the drive
+
+`src/snapshot.rs` writes the records to a file together with the place in the journal they are
+current to. The next start loads the file and reads the journal from that place, which brings
+in everything that happened while nothing was watching.
+
+The saved file is used only when it can be trusted. It carries a check value, the drive's serial
+number and the journal's id. If the file is missing, cut short, changed, from another drive, or
+older than the journal goes back, the drive is read in full instead. The tests cut the file at
+every length and change every byte to make sure each case is refused.
+
+The tests for all of this run on any system against a made-up drive and journal. On Windows, CI
+does it for real: it changes files on the runner's system drive (create, grow, rename, move,
+rename the folder, add a second name, delete) and checks the index after each step, then stops
+watching, changes more files, and starts again from the saved index.
+
+Things to know:
+
+- A change is searchable after the index is rebuilt, which took 0.7 to 1.0 seconds on the test
+  drive. That is fine as a background step, but updating the index in place is the better
+  design and comes next.
+- A drive changed by another system that does not write the journal (Linux writing to an NTFS
+  drive, for example) will have changes the saved index does not know about.
+- Windows keeps a limited amount of journal. After a long time away on a busy drive the journal
+  no longer goes back far enough, and the start falls back to a full read.
 
 ## Benchmark
 
 ### A real drive
 
-Measured in CI on GitHub's hosted Windows runner (`drive C`, release build), on its C: drive:
-NTFS, 1,201,656 file names and 208,530 folders. Three runs on separate machines:
+Measured in CI on GitHub's hosted Windows runner (release build), on its C: drive: NTFS, about
+1.2 million file names and 208,500 folders. Each run is on a separate machine.
+
+Reading the whole drive (`drive C`), nine runs:
 
 | | First read | Read again |
 | --- | ---: | ---: |
-| Reading the file table off the drive | 8.7, 9.0 and 11.0 s | 3.2, 5.8 and 3.2 s |
-| Arranging the records into the index | 0.8 s | 0.8 s |
-| **Total** | **9.5, 9.8 and 11.9 s** | **4.0, 6.5 and 4.0 s** |
+| Reading the file table off the drive | 8.3 to 13.3 s in eight runs, 3.4 s in one | 3.2 to 5.8 s |
+| Arranging the records into the index | 0.7 to 1.0 s | 0.7 to 1.0 s |
+| **Total** | **9.0 to 14.2 s** in eight runs, 4.3 s in one | **4.0 to 6.5 s** |
 
-The index holds 102 MB of memory, and a search for `system32` (723 matches) took about 5 ms.
+The one fast first read was as quick as a second read, so that runner had most likely read
+the table before the test began. The index holds 102 MB of memory, and a search for `system32` (629 to 723 matches) took 4 to
+5 ms.
 
-The runner's drive is a cloud virtual disk, and the table on it is about 1.4 GB. It has not been
-measured on a PC with a local SSD yet. The earlier reader (`--reader records`) took 36 to 42
-seconds when it was the first thing to read the same drive, and about 3.5 seconds once Windows
-had the table in memory.
+Following changes and starting from a saved index (`watch C --saved`), four or five runs each. The
+machines differ in speed, so these are ranges:
 
-Every pull request repeats these reads, and the result lines are attached to the CI run as
+| | |
+| --- | ---: |
+| Taking in a handful of changed files | 0.1 to 0.3 ms |
+| Rebuilding the index so they can be searched | 0.7 to 1.0 s |
+| Saving the index (a 69 MB file) | 0.30 to 0.31 s |
+| Starting from the saved index, catching up included | 0.8 to 1.2 s over eight starts |
+
+The start from the saved index was timed right after the file was written, so Windows still had
+it in memory, and only a few files had changed in between. A start after a restart, or after a
+day of changes, has not been measured.
+
+The runner's drive is a cloud virtual disk, and the table on it is about 1.4 GB. None of this
+has been measured on a PC with a local SSD yet. The earlier reader (`--reader records`) took 36
+to 42 seconds when it was the first thing to read the same drive, and 2.9 to 3.5 seconds once
+Windows had the table in memory.
+
+Every pull request repeats these steps, and the result lines are attached to the CI run as
 notices.
 
 ### A made-up drive
@@ -150,7 +218,7 @@ cargo test
 
 ## What comes next
 
-1. Follow the NTFS change journal, so new and renamed files show up without a rescan.
-2. Save the index to disk and load it at startup.
-3. Rank results, so the most likely file comes first.
-4. Add up folder sizes, which the disk map needs.
+1. Update the index in place when a file changes, instead of rebuilding it.
+2. Rank results, so the most likely file comes first.
+3. Add up folder sizes, which the disk map needs.
+4. Measure all of it on a PC with a local SSD.
