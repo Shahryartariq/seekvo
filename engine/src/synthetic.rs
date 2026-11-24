@@ -72,17 +72,35 @@ impl Sizes {
     }
 }
 
+/// The newest time of last change on the made-up drive: a day in 2026.
+const NEWEST: u32 = 1_790_000_000;
+
+/// Add an entry with a made-up time of last change. The times are spread
+/// over about six years and are the same on every run.
+fn add(
+    b: &mut IndexBuilder,
+    parent: Option<EntryId>,
+    name: &str,
+    kind: Kind,
+    size: u64,
+) -> Result<EntryId, BuildError> {
+    let n = b.len() as u64;
+    let days = (n.wrapping_mul(2_654_435_761) >> 7) % 2_200;
+    let modified = NEWEST - (days * 86_400 + n % 86_400) as u32;
+    b.add_dated(parent, name, kind, size, modified)
+}
+
 /// Build a drive with at least `files` files.
 pub fn build(files: usize) -> Result<Index, BuildError> {
     let mut b = IndexBuilder::new();
     let mut sizes = Sizes(0x9E37_79B9_7F4A_7C15);
     let mut made = 0usize;
 
-    let c = b.add(None, "C:\\", Kind::Dir, 0)?;
-    let d = b.add(None, "D:\\", Kind::Dir, 0)?;
-    let dev = b.add(Some(c), "Dev", Kind::Dir, 0)?;
-    let photos = b.add(Some(d), "Photos", Kind::Dir, 0)?;
-    let finance = b.add(Some(d), "Finance", Kind::Dir, 0)?;
+    let c = add(&mut b, None, "C:\\", Kind::Dir, 0)?;
+    let d = add(&mut b, None, "D:\\", Kind::Dir, 0)?;
+    let dev = add(&mut b, Some(c), "Dev", Kind::Dir, 0)?;
+    let photos = add(&mut b, Some(d), "Photos", Kind::Dir, 0)?;
+    let finance = add(&mut b, Some(d), "Finance", Kind::Dir, 0)?;
 
     let mut round = 0usize;
     while made < files {
@@ -108,17 +126,19 @@ fn project(
     round: usize,
 ) -> Result<usize, BuildError> {
     let mut made = 0;
-    let root = b.add(Some(dev), &format!("project-{round:05}"), Kind::Dir, 0)?;
-    b.add(
+    let root = add(b, Some(dev), &format!("project-{round:05}"), Kind::Dir, 0)?;
+    add(
+        b,
         Some(root),
         "package.json",
         Kind::File,
         sizes.next(300, 6_000),
     )?;
     made += 1;
-    let src = b.add(Some(root), "src", Kind::Dir, 0)?;
+    let src = add(b, Some(root), "src", Kind::Dir, 0)?;
     for module in MODULES {
-        b.add(
+        add(
+            b,
             Some(src),
             &format!("{module}.ts"),
             Kind::File,
@@ -126,16 +146,18 @@ fn project(
         )?;
         made += 1;
     }
-    let modules = b.add(Some(root), "node_modules", Kind::Dir, 0)?;
+    let modules = add(b, Some(root), "node_modules", Kind::Dir, 0)?;
     for package in PACKAGES {
-        let folder = b.add(Some(modules), package, Kind::Dir, 0)?;
-        b.add(
+        let folder = add(b, Some(modules), package, Kind::Dir, 0)?;
+        add(
+            b,
             Some(folder),
             "index.js",
             Kind::File,
             sizes.next(400, 180_000),
         )?;
-        b.add(
+        add(
+            b,
             Some(folder),
             "package.json",
             Kind::File,
@@ -155,7 +177,8 @@ fn album(
 ) -> Result<usize, BuildError> {
     let trip = TRIPS[round % TRIPS.len()];
     let year = 2015 + (round / TRIPS.len()) % 12;
-    let folder = b.add(
+    let folder = add(
+        b,
         Some(photos),
         &format!("{year} {trip} {round:05}"),
         Kind::Dir,
@@ -163,7 +186,8 @@ fn album(
     )?;
     for n in 0..200 {
         let name = format!("IMG_{:04}.jpg", (round * 37 + n) % 10_000);
-        b.add(
+        add(
+            b,
             Some(folder),
             &name,
             Kind::File,
@@ -181,17 +205,25 @@ fn paperwork(
     round: usize,
 ) -> Result<usize, BuildError> {
     let year = 2000 + round % 27;
-    let folder = b.add(Some(finance), &format!("{year}-{round:05}"), Kind::Dir, 0)?;
+    let folder = add(
+        b,
+        Some(finance),
+        &format!("{year}-{round:05}"),
+        Kind::Dir,
+        0,
+    )?;
     for month in MONTHS {
         let invoice = format!("Invoice-{month}-{year}.pdf");
-        b.add(
+        add(
+            b,
             Some(folder),
             &invoice,
             Kind::File,
             sizes.next(90_000, 4_000_000),
         )?;
         let statement = format!("bank-statement-{month}.pdf");
-        b.add(
+        add(
+            b,
             Some(folder),
             &statement,
             Kind::File,

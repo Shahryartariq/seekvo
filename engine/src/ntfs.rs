@@ -41,11 +41,13 @@ struct Row {
     record: u64,
     parent: u64,
     name_start: usize,
-    name_len: u32,
+    name_len: u16,
     is_dir: bool,
     /// Replaced or removed since it was added; skipped everywhere.
     dead: bool,
     size: u64,
+    /// Seconds since 1970, or 0 when not known.
+    modified: u32,
 }
 
 /// File records as they come off a drive: unordered, each naming its parent
@@ -75,6 +77,8 @@ pub struct RecordRow<'a> {
     pub name: &'a str,
     pub is_dir: bool,
     pub size: u64,
+    /// Seconds since 1970, or 0 when not known.
+    pub modified: u32,
 }
 
 impl VolumeRecords {
@@ -103,6 +107,7 @@ impl VolumeRecords {
                 name: self.name(row),
                 is_dir: row.is_dir,
                 size: row.size,
+                modified: row.modified,
             })
     }
 
@@ -130,9 +135,30 @@ impl VolumeRecords {
         is_dir: bool,
         size: u64,
     ) {
+        self.push_dated(file_reference, parent_reference, name, is_dir, size, 0);
+    }
+
+    /// Add one record with a known size in bytes and the time it was last
+    /// changed, in seconds since 1970 (0 when not known).
+    pub fn push_dated(
+        &mut self,
+        file_reference: u64,
+        parent_reference: u64,
+        name: &str,
+        is_dir: bool,
+        size: u64,
+        modified: u32,
+    ) {
         let name_start = self.names.len();
         self.names.push_str(name);
-        self.push_row(file_reference, parent_reference, name_start, is_dir, size);
+        self.push_row(
+            file_reference,
+            parent_reference,
+            name_start,
+            is_dir,
+            size,
+            modified,
+        );
     }
 
     pub(crate) fn push_utf16(
@@ -148,7 +174,7 @@ impl VolumeRecords {
         self.names.extend(
             char::decode_utf16(units).map(|unit| unit.unwrap_or(char::REPLACEMENT_CHARACTER)),
         );
-        self.push_row(file_reference, parent_reference, name_start, is_dir, 0);
+        self.push_row(file_reference, parent_reference, name_start, is_dir, 0, 0);
     }
 
     fn push_row(
@@ -158,9 +184,20 @@ impl VolumeRecords {
         name_start: usize,
         is_dir: bool,
         size: u64,
+        modified: u32,
     ) {
-        // An NTFS name is at most 255 UTF-16 units, far below u32.
-        let name_len = (self.names.len() - name_start) as u32;
+        // An NTFS name is at most 255 UTF-16 units, which is 765 bytes at
+        // most. Anything longer than the length field can hold did not
+        // come from a drive, and is cut at a character.
+        let longest = usize::from(u16::MAX);
+        if self.names.len() - name_start > longest {
+            let mut cut = name_start + longest;
+            while !self.names.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.names.truncate(cut);
+        }
+        let name_len = (self.names.len() - name_start) as u16;
         let record = file_reference & RECORD_NUMBER_MASK;
         if self.sealed {
             self.added.entry(record).or_default().push(self.rows.len());
@@ -173,17 +210,20 @@ impl VolumeRecords {
             is_dir,
             dead: false,
             size,
+            modified,
         });
     }
 
     /// Fill in what the rows could not know when they were added. `lookup`
-    /// gets a record number and returns whether it is a folder and its
-    /// size, or `None` to drop every row for that record.
-    pub(crate) fn resolve(&mut self, lookup: impl Fn(u64) -> Option<(bool, u64)>) {
+    /// gets a record number and returns whether it is a folder, its size
+    /// and when it was last changed, or `None` to drop every row for that
+    /// record.
+    pub(crate) fn resolve(&mut self, lookup: impl Fn(u64) -> Option<(bool, u64, u32)>) {
         self.rows.retain_mut(|row| match lookup(row.record) {
-            Some((is_dir, size)) => {
+            Some((is_dir, size, modified)) => {
                 row.is_dir = is_dir;
                 row.size = size;
+                row.modified = modified;
                 true
             }
             None => false,
@@ -250,6 +290,15 @@ impl VolumeRecords {
     /// The size last recorded for a record number, if it is known at all.
     pub fn size_of(&self, record: u64) -> Option<u64> {
         self.rows_of(record).first().map(|&i| self.rows[i].size)
+    }
+
+    /// When a record number was last changed, as last recorded, if it is
+    /// known at all.
+    pub fn modified_of(&self, record: u64) -> Option<u32> {
+        self.rows_of(record)
+            .first()
+            .map(|&i| self.rows[i].modified)
+            .filter(|&modified| modified != 0)
     }
 
     fn name(&self, row: &Row) -> &str {
@@ -448,11 +497,23 @@ pub fn build_index(
                 if !entered.insert(row.record) {
                     continue;
                 }
-                let id = builder.add(Some(folder_id), records.name(row), Kind::Dir, 0)?;
+                let id = builder.add_dated(
+                    Some(folder_id),
+                    records.name(row),
+                    Kind::Dir,
+                    0,
+                    row.modified,
+                )?;
                 stats.dirs += 1;
                 queue.push_back((row.record, id));
             } else {
-                builder.add(Some(folder_id), records.name(row), Kind::File, row.size)?;
+                builder.add_dated(
+                    Some(folder_id),
+                    records.name(row),
+                    Kind::File,
+                    row.size,
+                    row.modified,
+                )?;
                 stats.files += 1;
             }
             placed += 1;
@@ -1432,6 +1493,23 @@ mod tests {
     }
 
     #[test]
+    fn a_name_too_long_for_any_drive_is_cut_at_a_character() {
+        let mut records = VolumeRecords::new();
+        let long = "é".repeat(40_000); // 80,000 bytes
+        records.push_dated(30, ROOT_RECORD, &long, false, 1, 7);
+        records.push_dated(31, ROOT_RECORD, "after.txt", false, 2, 8);
+        let rows: Vec<RecordRow<'_>> = records.iter().collect();
+        assert_eq!(rows[0].name.len(), 65_534);
+        assert!(rows[0].name.chars().all(|c| c == 'é'));
+        assert_eq!(
+            (rows[1].name, rows[1].size, rows[1].modified),
+            ("after.txt", 2, 8)
+        );
+        assert_eq!(records.modified_of(31), Some(8));
+        assert_eq!(records.modified_of(99), None);
+    }
+
+    #[test]
     fn parses_a_buffer_of_journal_entries() {
         let mut first = usn_record(reference(40), reference(5), 0, &utf16("a.txt"));
         first[24..32].copy_from_slice(&1_000i64.to_le_bytes());
@@ -1673,6 +1751,18 @@ mod tests {
                 .find(|&&id| index.path(id).unwrap().to_lowercase() == wanted)
                 .unwrap_or_else(|| panic!("{wanted} is missing from the index"));
             assert_eq!(index.size(*found), Some(metadata.len()), "{wanted}");
+            // The time read off the drive is the one Windows reports.
+            let changed = metadata
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert_eq!(
+                index.modified(*found).map(u64::from),
+                Some(changed),
+                "{wanted}"
+            );
             compared += 1;
         }
         assert!(compared >= 3, "only {compared} known files exist here");

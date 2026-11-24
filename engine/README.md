@@ -7,6 +7,8 @@ app itself.
 
 - **An in-memory index** of files and folders: name, parent folder, size and extension.
 - **Search** across that index: several words in any order, any letter case, and an `ext:` filter.
+- **Ranked results.** The most likely file comes first: a name that is the word you typed beats a
+  name that merely contains it, and among equals the file changed most recently wins.
 - **A whole-drive reader for NTFS.** It reads the drive's file table directly instead of walking
   folders, and gets every file's size and every name of a hard-linked file. On a real Windows
   drive with 1.4 million files and folders the first read took 9 to 14 seconds in eight runs
@@ -22,8 +24,8 @@ app itself.
   Linux and needs no special rights.
 - **A command-line tool** to try all of this and to run the benchmark.
 
-Not built yet: ranking results, and updating the index in place when a file changes (today it
-is rebuilt, which takes most of a second on a big drive).
+Not built yet: updating the index in place when a file changes (today it is rebuilt, which
+takes most of a second on a big drive).
 
 ## Try it
 
@@ -61,6 +63,44 @@ only reads the drive. The one thing it writes is the saved index, and only to th
   folder, not the 40,000 pictures inside it. Pass `--path` to get everything inside as well.
 - `ext:pdf` keeps only files with that extension.
 
+## How results are ordered
+
+A search can match thousands of files, and only the first screen gets read. Results are ordered
+by four things, the first outweighing all the others together:
+
+1. **How well each word fits the name.** A name is made of words, split at `-`, `_`, `.`, spaces
+   and wherever letters meet digits. For the search `report`:
+
+   | The word is | Example | Points |
+   | --- | --- | ---: |
+   | a whole word at the start of the name | `report-2026.pdf` | 12 |
+   | a whole word elsewhere | `annual report.pdf` | 10 |
+   | the start of the name | `reporting.pdf` | 8 |
+   | the start of a word | `annual-reporting.pdf` | 6 |
+   | the end of a word | `prereport.pdf` | 4 |
+   | inside a word | `prereporting.pdf` | 3 |
+
+   Points add up over the words searched for. A word found only in a folder name adds none, so
+   `invoice 2026` puts `invoice-2026.pdf` above an `invoice.pdf` that sits in a folder called
+   `2026`.
+2. **How much of the name the words account for.** `invoice.pdf` comes before
+   `invoice-march-2026-final-v2.pdf`.
+3. **How recently the file changed**, in steps: the last day, week, month, year, three years.
+   "Recent" is counted from the newest file on the drive, so the order does not depend on the
+   clock.
+4. **How near the top of the drive it is.** A `readme.md` in a project folder comes before one
+   twenty folders down.
+
+A search by extension alone (`ext:pdf`) has no words to fit, so it lists the most recently
+changed files first.
+
+On the test drive, `system32` matches 629 files and folders, and `C:\Windows\System32` comes
+first.
+
+The fast ranking in `src/index.rs` is checked against a second, slow one written from this
+description, on a few thousand files and many searches. The two must agree on every result and
+on the order.
+
 ## How it is built
 
 A million files stored as a million small objects means a million places in memory to visit.
@@ -87,7 +127,8 @@ file on the drive. `src/mft.rs` reads it without going through the file system:
 2. The table's own first record lists the stretches of the drive it is stored in. On a
    fragmented drive that list continues in further records, which the reader follows.
 3. Each record is checked (NTFS marks the end of every 512 bytes so a half-written record can be
-   told apart) and then read for its names, its parent folder and the size of its data.
+   told apart) and then read for its names, its parent folder, the size of its data and when
+   it was last changed.
 
 The records come out in table order, each naming its parent by number. `src/ntfs.rs` sorts them
 by parent and walks down from the top folder, so parents land in the index before their
@@ -98,7 +139,8 @@ skipped and counted. The tests run the reader on the file table of a real volume
 with `mkntfs`, filled through `ntfs-3g`; see `tests/fixtures/`), on a hand-made volume for cases
 a healthy one does not have, and on the real table with random bytes flipped, 400 times over,
 to check that damage produces an error or a shorter listing and never a crash. On Windows a
-further test reads the real system drive and compares file sizes with what Windows reports.
+further test reads the real system drive and compares file sizes and times of last change
+with what Windows reports.
 
 `--reader records` uses the earlier method, which asks Windows for a summary of each record
 (`FSCTL_ENUM_USN_DATA`). It has no sizes and one name per file.
@@ -163,8 +205,8 @@ Reading the whole drive (`drive C`), nine runs:
 | **Total** | **9.0 to 14.2 s** in eight runs, 4.3 s in one | **4.0 to 6.5 s** |
 
 The one fast first read was as quick as a second read, so that runner had most likely read
-the table before the test began. The index holds 102 MB of memory, and a search for `system32` (629 to 723 matches) took 4 to
-5 ms.
+the table before the test began. The index holds 110 MB of memory, and a ranked search for
+`system32` (629 matches) took 5 to 8 ms.
 
 Following changes and starting from a saved index (`watch C --saved`), four or five runs each. The
 machines differ in speed, so these are ranges:
@@ -173,7 +215,7 @@ machines differ in speed, so these are ranges:
 | --- | ---: |
 | Taking in a handful of changed files | 0.1 to 0.3 ms |
 | Rebuilding the index so they can be searched | 0.7 to 1.0 s |
-| Saving the index (a 69 MB file) | 0.30 to 0.31 s |
+| Saving the index (a 75 MB file) | 0.14 to 0.31 s |
 | Starting from the saved index, catching up included | 0.8 to 1.2 s over eight starts |
 
 The start from the saved index was timed right after the file was written, so Windows still had
@@ -190,21 +232,26 @@ notices.
 
 ### A made-up drive
 
-`cargo run --release -- bench` on a 2-core cloud VM (Intel Xeon, 2.3 GHz), one thread:
+`cargo run --release -- bench` on a 2-core cloud VM (Intel Xeon, 2.1 GHz), one thread. Every
+search is ranked and returns the best 50.
 
-A made-up drive with 1,117,955 entries, 53 MB of memory, built in 115 ms.
+A made-up drive with 1,117,955 entries, 58 MB of memory, built in about 0.2 s.
 
 | Search | Matches | Median | Slowest of 30 |
 | --- | ---: | ---: | ---: |
-| `invoice` | 40,404 | 3.2 ms | 6.6 ms |
-| `invoice march 2026` | 125 | 7.7 ms | 11.3 ms |
-| `react index` | 3,368 | 5.5 ms | 5.6 ms |
-| `node_modules react --path` | 10,104 | 4.9 ms | 5.0 ms |
-| `ext:jpg` | 673,400 | 1.1 ms | 1.4 ms |
-| `img_10 hunza` | 1,450 | 5.1 ms | 7.9 ms |
-| `statement ext:pdf` | 40,404 | 3.2 ms | 3.6 ms |
-| `e` | 368,437 | 4.7 ms | 4.9 ms |
-| `zzzz` | 0 | 2.4 ms | 2.7 ms |
+| `invoice` | 40,404 | 5.1 ms | 9.6 ms |
+| `invoice march 2026` | 125 | 10.0 ms | 11.8 ms |
+| `react index` | 3,368 | 7.3 ms | 9.3 ms |
+| `node_modules react --path` | 10,104 | 6.7 ms | 7.5 ms |
+| `ext:jpg` | 673,400 | 3.6 ms | 4.2 ms |
+| `img_10 hunza` | 1,450 | 6.8 ms | 12.1 ms |
+| `statement ext:pdf` | 40,404 | 4.8 ms | 5.3 ms |
+| `e` | 368,437 | 11.7 ms | 12.5 ms |
+| `zzzz` | 0 | 2.7 ms | 4.6 ms |
+
+What ranking costs, measured against the unranked search on the same machine: most searches are
+within a tenth of what they took before. The two with the most matches pay more: `ext:jpg` went
+from 1.2 to 3.6 ms, and the single letter `e` from 5.7 to 11.7 ms.
 
 Your machine will give different numbers.
 
@@ -219,6 +266,6 @@ cargo test
 ## What comes next
 
 1. Update the index in place when a file changes, instead of rebuilding it.
-2. Rank results, so the most likely file comes first.
+2. The app window: a search box and results list on top of this engine.
 3. Add up folder sizes, which the disk map needs.
 4. Measure all of it on a PC with a local SSD.
