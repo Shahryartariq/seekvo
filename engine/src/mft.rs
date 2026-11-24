@@ -85,6 +85,7 @@ const RECORD_NUMBER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// the drive's real sector size is.
 const FIXUP_STRIDE: usize = 512;
 const ATTRIBUTE_LIST: u32 = 0x20;
+const ATTRIBUTE_STANDARD_INFORMATION: u32 = 0x10;
 const ATTRIBUTE_FILE_NAME: u32 = 0x30;
 const ATTRIBUTE_DATA: u32 = 0x80;
 const ATTRIBUTE_END: u32 = 0xFFFF_FFFF;
@@ -318,6 +319,27 @@ fn parse_file_name(attribute: &[u8]) -> Option<(u64, &[u8])> {
     Some((parent, name))
 }
 
+/// Seconds from the start of 1601, where Windows starts counting, to the
+/// start of 1970.
+const SECONDS_1601_TO_1970: i64 = 11_644_473_600;
+
+/// Turn a Windows time (100-nanosecond steps since 1601) into seconds since
+/// 1970. Times before 1970 or too far ahead to fit give `None`.
+pub fn unix_seconds(filetime: i64) -> Option<u32> {
+    let seconds = filetime.div_euclid(10_000_000) - SECONDS_1601_TO_1970;
+    u32::try_from(seconds).ok().filter(|&seconds| seconds != 0)
+}
+
+/// When a file's contents were last changed, from its standard-information
+/// attribute.
+fn parse_modified(attribute: &[u8]) -> Option<u32> {
+    let length = u32_at(attribute, 0x10)? as usize;
+    let at = usize::from(u16_at(attribute, 0x14)?);
+    let value = attribute.get(at..at.checked_add(length)?)?;
+    // Created, changed, record changed, read: eight bytes each.
+    unix_seconds(u64_at(value, 8)? as i64)
+}
+
 /// Walk the attributes of a checked record, calling `visit` with each
 /// attribute's type and bytes.
 fn for_each_attribute(record: &[u8], mut visit: impl FnMut(u32, &[u8])) {
@@ -353,6 +375,8 @@ struct Scan {
     flags: Vec<u8>,
     /// Per record number: size of the unnamed data, in bytes.
     sizes: Vec<u64>,
+    /// Per record number: when it was last changed, in seconds since 1970.
+    modified: Vec<u32>,
     /// Further pieces of the table itself, found in its overflow records:
     /// the cluster index each piece starts at, and its runs.
     table_pieces: Vec<(u64, Vec<Run>)>,
@@ -367,6 +391,7 @@ impl Scan {
             total_records,
             flags: Vec::new(),
             sizes: Vec::new(),
+            modified: Vec::new(),
             table_pieces: Vec::new(),
             in_use: 0,
             damaged: 0,
@@ -384,8 +409,10 @@ impl Scan {
             let more = slot + 1 - self.flags.len();
             self.flags.try_reserve(more).ok()?;
             self.sizes.try_reserve(more).ok()?;
+            self.modified.try_reserve(more).ok()?;
             self.flags.resize(slot + 1, 0);
             self.sizes.resize(slot + 1, 0);
+            self.modified.resize(slot + 1, 0);
         }
         Some(slot)
     }
@@ -434,6 +461,11 @@ impl Scan {
             let is_resident = attribute.get(8) == Some(&0);
             let name_length = attribute.get(9).copied().unwrap_or(0);
             match kind {
+                ATTRIBUTE_STANDARD_INFORMATION if is_resident => {
+                    if let Some(modified) = parse_modified(attribute) {
+                        self.modified[slot] = modified;
+                    }
+                }
                 ATTRIBUTE_FILE_NAME if is_resident => self.file_name(attribute, owner),
                 ATTRIBUTE_DATA if name_length == 0 => match parse_data(attribute) {
                     Some(Data::Inside { size }) => self.sizes[slot] = size,
@@ -467,14 +499,14 @@ impl Scan {
     }
 
     fn finish(mut self) -> FileTable {
-        let (flags, sizes) = (&self.flags, &self.sizes);
+        let (flags, sizes, modified) = (&self.flags, &self.sizes, &self.modified);
         self.records.resolve(|record| {
             let slot = usize::try_from(record).ok()?;
             let flag = *flags.get(slot)?;
             if flag & FLAG_IN_USE == 0 {
                 return None;
             }
-            Some((flag & FLAG_DIRECTORY != 0, sizes[slot]))
+            Some((flag & FLAG_DIRECTORY != 0, sizes[slot], modified[slot]))
         });
         FileTable {
             records: self.records,
@@ -501,6 +533,8 @@ pub struct FileRecord {
     /// Size of the file's data in bytes, when this record holds the start
     /// of it.
     pub size: Option<u64>,
+    /// When the file was last changed, in seconds since the start of 1970.
+    pub modified: Option<u32>,
     /// Other records that hold names, or the start of the data, for this
     /// file.
     pub continued_in: Vec<u64>,
@@ -539,6 +573,9 @@ pub fn parse_file_record(bytes: &[u8]) -> Option<FileRecord> {
         let is_resident = attribute.get(8) == Some(&0);
         let name_length = attribute.get(9).copied().unwrap_or(0);
         match kind {
+            ATTRIBUTE_STANDARD_INFORMATION if is_resident && found.modified.is_none() => {
+                found.modified = parse_modified(attribute);
+            }
             ATTRIBUTE_LIST if is_resident => list_entries(attribute, &mut found.continued_in),
             ATTRIBUTE_LIST => found.list_elsewhere = true,
             ATTRIBUTE_FILE_NAME if is_resident => {
@@ -754,6 +791,22 @@ pub(crate) mod testing {
         bytes
     }
 
+    /// A standard-information attribute for something last changed at
+    /// `modified`, in seconds since 1970.
+    pub(crate) fn changed_at(modified: u32) -> Vec<u8> {
+        let filetime = (i64::from(modified) + SECONDS_1601_TO_1970) * 10_000_000 + 1_234_567;
+        let mut attribute = vec![0u8; 24 + 48];
+        attribute[0..4].copy_from_slice(&ATTRIBUTE_STANDARD_INFORMATION.to_le_bytes());
+        attribute[0x10..0x14].copy_from_slice(&48u32.to_le_bytes());
+        attribute[0x14..0x16].copy_from_slice(&24u16.to_le_bytes());
+        // Created long before, read long after; only "changed" is wanted.
+        attribute[24..32].copy_from_slice(&1i64.to_le_bytes());
+        attribute[32..40].copy_from_slice(&filetime.to_le_bytes());
+        attribute[40..48].copy_from_slice(&i64::MAX.to_le_bytes());
+        attribute[48..56].copy_from_slice(&i64::MAX.to_le_bytes());
+        padded(attribute)
+    }
+
     pub(crate) fn name_attribute(parent: u64, name: &str, namespace: u8) -> Vec<u8> {
         let units: Vec<u16> = name.encode_utf16().collect();
         let mut value = vec![0u8; 0x42];
@@ -960,6 +1013,39 @@ mod tests {
     }
 
     #[test]
+    fn reads_when_each_file_on_a_real_volume_was_changed() {
+        let (index, _, _) = index_of(&mut Pieces::fixture());
+        // The volume was made and filled in 2026, so every file and folder
+        // on it was last changed that year.
+        let year_2026 = 1_767_225_600..1_798_761_600;
+        for id in 1..index.len() as EntryId {
+            let modified = index.modified(id);
+            assert!(
+                modified.is_some_and(|time| year_2026.contains(&time)),
+                "{} {modified:?}",
+                index.path(id).unwrap()
+            );
+        }
+        // The top folder's name is given by the caller, not read.
+        assert_eq!(index.modified(0), None);
+    }
+
+    #[test]
+    fn turns_windows_times_into_seconds_since_1970() {
+        // The start of the year 2000, a value found in any reference.
+        assert_eq!(unix_seconds(125_911_584_000_000_000), Some(946_684_800));
+        // Parts of a second are dropped.
+        assert_eq!(unix_seconds(125_911_584_009_999_999), Some(946_684_800));
+        // Before 1970, exactly 1970 (which stands for "not known"), and
+        // further ahead than fits.
+        assert_eq!(unix_seconds(0), None);
+        assert_eq!(unix_seconds(-5), None);
+        assert_eq!(unix_seconds(116_444_736_000_000_000), None);
+        assert_eq!(unix_seconds(116_444_736_010_000_000), Some(1));
+        assert_eq!(unix_seconds(i64::MAX), None);
+    }
+
+    #[test]
     fn reads_sizes_stored_inside_and_outside_the_record() {
         let (index, _, _) = index_of(&mut Pieces::fixture());
         // Five bytes fit inside the record itself.
@@ -1090,13 +1176,24 @@ mod tests {
             record(IN_USE, Some(0), &[data_outside(4, 0, &run(2, 20))]),
         );
 
-        put(16, record(FOLDER, None, &[name_attribute(ROOT, "Docs", 1)]));
+        put(
+            16,
+            record(
+                FOLDER,
+                None,
+                &[changed_at(1_700_000_000), name_attribute(ROOT, "Docs", 1)],
+            ),
+        );
         put(
             17,
             record(
                 IN_USE,
                 None,
-                &[name_attribute(16, "a.txt", 1), data_inside(5)],
+                &[
+                    changed_at(1_750_000_000),
+                    name_attribute(16, "a.txt", 1),
+                    data_inside(5),
+                ],
             ),
         );
         // A file whose data attribute did not fit and lives in record 19.
@@ -1106,6 +1203,7 @@ mod tests {
                 IN_USE,
                 None,
                 &[
+                    changed_at(1_760_000_000),
                     attribute_list(&[(0x30, 0, 0, 18), (0x80, 0, 0, 19)]),
                     name_attribute(ROOT, "split.bin", 1),
                 ],
@@ -1158,6 +1256,20 @@ mod tests {
                 ("/split.bin".to_owned(), 777),
                 ("/Docs/Long File Name.txt".to_owned(), 9),
                 ("/Docs/a.txt".to_owned(), 5),
+            ]
+        );
+        let modified: Vec<Option<u32>> = (0..index.len() as EntryId)
+            .map(|id| index.modified(id))
+            .collect();
+        assert_eq!(
+            modified,
+            [
+                None,
+                Some(1_700_000_000),
+                None,
+                Some(1_760_000_000),
+                None,
+                Some(1_750_000_000),
             ]
         );
         assert_eq!(table.damaged, 1);
@@ -1413,7 +1525,7 @@ mod tests {
 
     /// Build the index the slow way: start with nothing and look at every
     /// record one by one, as happens when the change journal names it.
-    fn one_by_one(source: &mut dyn BlockSource) -> Vec<(String, u64)> {
+    fn one_by_one(source: &mut dyn BlockSource) -> Vec<(String, u64, Option<u32>)> {
         let mut drive = Records::of(source);
         let mut numbers: Vec<u64> = drive.0.keys().copied().collect();
         // Highest first, so files arrive before the folders they are in.
@@ -1425,7 +1537,16 @@ mod tests {
             crate::live::refresh(&mut records, number, &mut drive).unwrap();
         }
         let (index, _) = build_index("/", &records).unwrap();
-        listing(&index)
+        dated(&index)
+    }
+
+    /// Every path with its size and time of last change.
+    fn dated(index: &Index) -> Vec<(String, u64, Option<u32>)> {
+        listing(index)
+            .into_iter()
+            .zip(0..)
+            .map(|((path, size), id)| (path, size, index.modified(id)))
+            .collect()
     }
 
     #[test]
@@ -1433,7 +1554,7 @@ mod tests {
         let mut real = Pieces::fixture();
         let (whole, stats, _) = index_of(&mut real);
         assert!(stats.files > 20);
-        assert_eq!(one_by_one(&mut real), listing(&whole));
+        assert_eq!(one_by_one(&mut real), dated(&whole));
 
         let mut made = Memory(hand_made());
         let (whole, _, _) = index_of(&mut made);
@@ -1442,8 +1563,8 @@ mod tests {
         // Read off the disk it fails its check and is skipped. A single
         // record is taken on trust, because Windows hands those over with
         // the check already done, and never hands over a torn one.
-        found.retain(|(path, _)| path != "/torn.txt");
-        assert_eq!(found, listing(&whole));
+        found.retain(|(path, _, _)| path != "/torn.txt");
+        assert_eq!(found, dated(&whole));
     }
 
     fn one_file() -> Vec<u8> {
@@ -1451,6 +1572,7 @@ mod tests {
             IN_USE,
             None,
             &[
+                changed_at(1_780_000_123),
                 attribute_list(&[(0x30, 0, 0, 40), (0x80, 0, 0, 41), (0x80, 0, 9, 42)]),
                 name_attribute(ROOT, "REPORT~1.PDF", 2),
                 name_attribute(ROOT, "report 2026.pdf", 1),
@@ -1474,6 +1596,7 @@ mod tests {
             ]
         );
         assert_eq!(found.size, Some(123_456));
+        assert_eq!(found.modified, Some(1_780_000_123));
         // Record 42 only holds a later stretch of the data, so it is not
         // worth reading.
         assert_eq!(found.continued_in, [40, 41]);

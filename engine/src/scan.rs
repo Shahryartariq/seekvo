@@ -74,7 +74,7 @@ pub fn scan_dir(root: &Path) -> Result<(Index, ScanStats), ScanError> {
             }
         };
 
-        let mut children: Vec<(String, Kind, u64)> = Vec::new();
+        let mut children: Vec<(String, Kind, u64, u32)> = Vec::new();
         for entry in reader {
             let Ok(entry) = entry else {
                 stats.skipped += 1;
@@ -85,22 +85,29 @@ pub fn scan_dir(root: &Path) -> Result<(Index, ScanStats), ScanError> {
                 continue;
             };
             let name = entry.file_name().to_string_lossy().into_owned();
+            // An entry whose size or time cannot be read is still worth
+            // listing.
+            let metadata = entry.metadata().ok();
+            let modified = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|since| u32::try_from(since.as_secs()).ok())
+                .unwrap_or(0);
             if file_type.is_dir() {
-                children.push((name, Kind::Dir, 0));
+                children.push((name, Kind::Dir, 0, modified));
             } else {
-                // A file whose size cannot be read is still worth listing.
-                let size = if file_type.is_file() {
-                    entry.metadata().map(|m| m.len()).unwrap_or(0)
-                } else {
-                    0
+                let size = match &metadata {
+                    Some(metadata) if file_type.is_file() => metadata.len(),
+                    _ => 0,
                 };
-                children.push((name, Kind::File, size));
+                children.push((name, Kind::File, size, modified));
             }
         }
         children.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-        for (name, kind, size) in children {
-            let id = builder.add(Some(dir_id), &name, kind, size)?;
+        for (name, kind, size, modified) in children {
+            let id = builder.add_dated(Some(dir_id), &name, kind, size, modified)?;
             match kind {
                 Kind::Dir => {
                     stats.dirs += 1;
@@ -175,6 +182,24 @@ mod tests {
                 .join("Finance")
                 .join("2026")
                 .join("invoice-march.pdf")
+        );
+    }
+
+    #[test]
+    fn reads_when_files_were_changed() {
+        let tree = TempTree::new();
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        tree.file("fresh.txt", "x");
+        let (index, _) = scan_dir(&tree.0).unwrap();
+        let hit = index.search(&Query::parse("fresh"), 1).hits[0];
+        let modified = u64::from(index.modified(hit).unwrap());
+        // Written just now, give or take a coarse file-system clock.
+        assert!(
+            modified + 5 >= before && modified <= before + 60,
+            "{modified} {before}"
         );
     }
 

@@ -332,6 +332,27 @@ fn run_scan(args: &[String]) -> Result<(), Stop> {
     Ok(())
 }
 
+/// A day as year-month-day, from seconds since the start of 1970 (UTC).
+fn date(seconds: u32) -> String {
+    // Days to a calendar date, by Howard Hinnant's method: count from
+    // 1 March of year 0, in 400-year cycles, so leap days fall at the end.
+    let days = i64::from(seconds / 86_400) + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 fn search_and_print(index: &Index, target: &Target) {
     if target.query.is_empty() {
         return;
@@ -344,13 +365,20 @@ fn search_and_print(index: &Index, target: &Target) {
         let Some(path) = index.path(id) else {
             continue;
         };
-        match (index.kind(id), index.size(id)) {
-            (Some(Kind::File), Some(size)) => println!("  {path}  ({})", file_size(size)),
-            _ => println!("  {path}"),
+        let size = match (index.kind(id), index.size(id)) {
+            (Some(Kind::File), Some(size)) => Some(file_size(size)),
+            _ => None,
+        };
+        let changed = index.modified(id).map(date);
+        match (size, changed) {
+            (Some(size), Some(changed)) => println!("  {path}  ({size}, changed {changed})"),
+            (Some(size), None) => println!("  {path}  ({size})"),
+            (None, Some(changed)) => println!("  {path}  (changed {changed})"),
+            (None, None) => println!("  {path}"),
         }
     }
     if result.total > result.hits.len() {
-        println!("  (showing the first {})", result.hits.len());
+        println!("  (showing the best {})", result.hits.len());
     }
 }
 

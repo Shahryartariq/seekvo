@@ -18,10 +18,11 @@ use crate::ntfs::VolumeRecords;
 
 /// The first bytes of every saved file. The number changes whenever the
 /// layout does, so an old file is refused instead of misread.
-const MAGIC: &[u8; 16] = b"SEEKVO-RECORDS-1";
+const MAGIC: &[u8; 16] = b"SEEKVO-RECORDS-2";
 const HEADER_BYTES: usize = 16 + 8 + 8 + 8 + 8;
-/// Record number, folder's record number, size, name length.
-const ROW_BYTES: usize = 8 + 8 + 8 + 2;
+/// Record number, folder's record number, size, time of last change, name
+/// length.
+const ROW_BYTES: usize = 8 + 8 + 8 + 4 + 2;
 const IS_FOLDER: u64 = 1 << 63;
 
 /// Which drive and which moment a saved file belongs to.
@@ -100,6 +101,7 @@ pub fn write(out: &mut impl Write, records: &VolumeRecords, origin: Origin) -> i
         bytes.extend_from_slice(&(row.record | kind).to_le_bytes());
         bytes.extend_from_slice(&row.parent.to_le_bytes());
         bytes.extend_from_slice(&row.size.to_le_bytes());
+        bytes.extend_from_slice(&row.modified.to_le_bytes());
         // An NTFS name is at most 255 UTF-16 units, which is at most 765
         // bytes of UTF-8.
         bytes.extend_from_slice(&(row.name.len() as u16).to_le_bytes());
@@ -152,18 +154,20 @@ fn parse(bytes: &[u8]) -> Option<Saved> {
         let record = u64_at(body, at)?;
         let parent = u64_at(body, at + 8)?;
         let size = u64_at(body, at + 16)?;
+        let modified = u32::from_le_bytes(body.get(at + 24..at + 28)?.try_into().ok()?);
         let name_length = usize::from(u16::from_le_bytes(
-            body.get(at + 24..at + 26)?.try_into().ok()?,
+            body.get(at + 28..at + 30)?.try_into().ok()?,
         ));
         at += ROW_BYTES;
         let name = std::str::from_utf8(body.get(at..at + name_length)?).ok()?;
         at += name_length;
-        records.push_sized(
+        records.push_dated(
             record & !IS_FOLDER,
             parent,
             name,
             record & IS_FOLDER != 0,
             size,
+            modified,
         );
     }
     (at == body.len()).then_some(Saved { origin, records })
@@ -183,14 +187,14 @@ mod tests {
     fn sample() -> VolumeRecords {
         let mut records = VolumeRecords::new();
         records.push_sized(30, 5, "Docs", true, 0);
-        records.push_sized(31, 30, "résumé – final.pdf", false, 123_456);
+        records.push_dated(31, 30, "résumé – final.pdf", false, 123_456, 1_790_000_000);
         records.push_sized(32, 5, "", false, 0);
-        records.push_sized(33, 30, "big.bin", false, u64::MAX / 3);
+        records.push_dated(33, 30, "big.bin", false, u64::MAX / 3, u32::MAX);
         records.push_sized(31, 5, "second name.pdf", false, 123_456);
         records
     }
 
-    fn rows(records: &VolumeRecords) -> Vec<(u64, u64, String, bool, u64)> {
+    fn rows(records: &VolumeRecords) -> Vec<(u64, u64, String, bool, u64, u32)> {
         records
             .iter()
             .map(|row| {
@@ -200,6 +204,7 @@ mod tests {
                     row.name.to_owned(),
                     row.is_dir,
                     row.size,
+                    row.modified,
                 )
             })
             .collect()
@@ -257,7 +262,7 @@ mod tests {
         ));
         // The next version's files are not this version's.
         let mut newer = saved(&sample());
-        newer[15] = b'2';
+        newer[15] = b'3';
         assert!(matches!(
             read(&mut newer.as_slice()),
             Err(SnapshotError::NotOurs)

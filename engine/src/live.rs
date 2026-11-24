@@ -162,6 +162,7 @@ fn look_up(number: u64, source: &mut dyn RecordSource) -> io::Result<Lookup> {
         }
         file.names.extend(part.names);
         file.size = file.size.or(part.size);
+        file.modified = file.modified.or(part.modified);
     }
     Ok(Lookup::File(file))
 }
@@ -200,9 +201,13 @@ pub fn refresh(
     } else {
         file.size.or_else(|| records.size_of(number)).unwrap_or(0)
     };
+    let modified = file
+        .modified
+        .or_else(|| records.modified_of(number))
+        .unwrap_or(0);
     records.remove_record(number);
     for (parent, name) in &file.names {
-        records.push_sized(number, *parent, name, file.is_dir, size);
+        records.push_dated(number, *parent, name, file.is_dir, size, modified);
     }
     Ok(())
 }
@@ -745,6 +750,48 @@ mod tests {
         assert_eq!(live.stats().files, 2);
         listing(&mut live);
         assert_eq!(live.stats().files, 7);
+    }
+
+    fn modified<V: RecordSource + Journal>(live: &mut Live<V>, path: &str) -> Option<u32> {
+        let index = live.index().unwrap();
+        let id = (0..index.len() as EntryId)
+            .find(|&id| index.path(id).unwrap().replace('\\', "/") == path)
+            .unwrap();
+        index.modified(id)
+    }
+
+    #[test]
+    fn keeps_track_of_when_files_were_changed() {
+        let (mut drive, records) = drive();
+        let mut live = follow(&mut drive, records);
+        let dated = |name: &str, modified: u32| {
+            record(
+                IN_USE,
+                None,
+                &[
+                    changed_at(modified),
+                    name_attribute(ROOT, name, 1),
+                    data_inside(1),
+                ],
+            )
+        };
+        live.volume
+            .write(40, dated("draft.txt", 1_790_000_000), NOW);
+        live.poll().unwrap();
+        assert_eq!(modified(&mut live, "/draft.txt"), Some(1_790_000_000));
+
+        // Saved again later, under a new name.
+        live.volume
+            .write(40, dated("final.txt", 1_790_000_500), NOW);
+        live.poll().unwrap();
+        assert_eq!(modified(&mut live, "/final.txt"), Some(1_790_000_500));
+
+        // A record that does not say when keeps the last known time.
+        live.volume.write(40, file(ROOT, "final.txt", 1), NOW);
+        live.poll().unwrap();
+        assert_eq!(modified(&mut live, "/final.txt"), Some(1_790_000_500));
+        // A file never seen with a time has none.
+        assert_eq!(modified(&mut live, "/notes.txt"), None);
     }
 
     #[test]
