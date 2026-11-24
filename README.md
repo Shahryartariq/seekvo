@@ -45,8 +45,8 @@ renamed and deleted files show up without a rescan, and it can save the index so
 start does not read the drive at all.
 
 - A real Windows drive with 1.4 million files and folders: first read and index in 9 to 14
-  seconds in eight runs out of nine (the ninth took 4.3), with every file's size, 102 MB of memory, and a search answered in
-  about 5 ms.
+  seconds in eight runs out of nine (the ninth took 4.3), with every file's size, 110 MB of memory, and a search answered in
+  5 to 8 ms with the most likely file first.
 - The same drive, started from a saved index: about a second (0.8 to 1.2 over eight starts),
   changes made in the meantime included. Timed right after saving; a start after a restart has not been measured.
 - Both measured in CI on GitHub's Windows runner, where the tests also change real files and
